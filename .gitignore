@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+.coverage
+build/
+dist/
+*.egg-info/
+
+.agentflow/runs/
+.agentflow/*.db
+.agentflow/*.db-*
+.agentflow/secrets/

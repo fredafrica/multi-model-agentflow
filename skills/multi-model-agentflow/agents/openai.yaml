@@ -1,0 +1,7 @@
+interface:
+  display_name: "Multi-Model AgentFlow"
+  short_description: "Plan and run risk-gated multi-model project workflows"
+  default_prompt: "Use $multi-model-agentflow to draft a bounded, reviewable execution plan for this project."
+
+policy:
+  allow_implicit_invocation: true
