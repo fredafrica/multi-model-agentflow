@@ -1011,6 +1011,31 @@ class Database:
         )
         return int(row["count"])
 
+    def unresolved_suspected_step_limit_calls(self, run_id: str) -> int:
+        """Count failed calls with no resolution path other than manual review.
+
+        A ``suspected_step_limit`` call cannot be continued, so resuming the run
+        would only pause the same failure again. These calls must be inspected
+        or resolved through the existing authorization flow before resume.
+        """
+        rows = self.connection.execute(
+            """
+            SELECT model_calls.raw_metadata_json
+            FROM model_calls
+            JOIN attempts USING (attempt_id)
+            WHERE attempts.run_id = ? AND model_calls.state = ?
+            """,
+            (run_id, InvocationState.FAILED.value),
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if not row["raw_metadata_json"]:
+                continue
+            metadata = json.loads(row["raw_metadata_json"])
+            if metadata.get("failure_kind") == "suspected_step_limit":
+                count += 1
+        return count
+
     def step_limit_calls_without_continuation(self, run_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """

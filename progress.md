@@ -2,6 +2,11 @@
 
 ## 2026-09-05
 
+- 里程碑 18 完成：将两种真实 OpenCode 同行摘要引导语加入严格白名单，未知后缀改为 `suspected_step_limit` 安全暂停。
+- Codex 独立发现并关闭三个边界：疑似识别漏掉其他合法裸标记变体、`reachedness` 词边界误报、resume 重复暂停。
+- 最终复核又补充“句点后无空格的未知后缀”回归。定向 3/3、全量 193/193、compileall、修改文件 Ruff 和 `git diff --check` 通过。
+- 全仓 Ruff 0.14.1 仍有 4 项历史错误，mypy 仍有 17 项历史错误；本轮未修改无关问题。真实 Qwen 长 Markdown 续接运行待核对已批准 AgentFlow 计划哈希。
+
 - 修复真实步骤耗尽检测遗漏：真实 Qwen implementation/revision 输出把终止标记作为“前缀推理文本 + `</think>` + 独立终止行 + 长 Markdown Summary”中的独立行，旧 `_text_reports_step_limit` 只检查首行或整段 `fullmatch`，导致两个调用被误记 `completed` 并错误进入 revision。
 - 将 `_text_reports_step_limit` 改为逐行结构化扫描：跟踪 fenced code、跳过 blockquote/diff/缩进，仅匹配规范化后整行等于已接受终止标记的行；检测到后抛 `InvocationIncompleteError`（`step_limit_reached`、`termination_source=final_text`）并保留 session ID、Token、费用、耗时与输出证据；退出码 0 与非 0 均正确分类。
 - Runner 经既有同会话 continuation 续接而非运行 deterministic tests 或开启新 revision；新增真实 OpenCodeAdapter 替身回归证明 base 记步骤耗尽、产生 `continuation.scheduled`、同 session 递增 segment_index，第二段完成后才进入确定性测试；review/rereview 仍不续接。

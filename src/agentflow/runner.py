@@ -120,6 +120,12 @@ class Runner:
             raise ValueError(
                 "run has an UNKNOWN model call that must be reconciled before resume"
             )
+        if self.database.unresolved_suspected_step_limit_calls(run_id):
+            raise ValueError(
+                "run has a suspected step-limit model call that requires manual "
+                "inspection or resolution through the existing authorization "
+                "flow before resume"
+            )
         if self._has_blocking_incomplete_call(run_id, plan):
             raise ValueError(
                 "run has a step-limit model call that cannot be continued; "
@@ -181,6 +187,8 @@ class Runner:
                 state = self.database.task_state(run_id, task.task_id)
                 if error.failure_kind == "session_mismatch":
                     reason = "session_mismatch"
+                elif error.failure_kind == "suspected_step_limit":
+                    reason = "suspected_step_limit"
                 elif state in (TaskState.WAITING_REVIEW, TaskState.WAITING_REREVIEW):
                     reason = "review_step_limit_reached"
                 else:

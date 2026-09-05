@@ -978,6 +978,225 @@ class ContinuationTests(unittest.TestCase):
             self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
         )
 
+    def test_real_adapter_summary_step_limit_continues_in_same_session(self) -> None:
+        task = replace(
+            make_task("task-1"),
+            implementation_model=ModelRef(
+                "lmstudio", "qwen/qwen3.8-27b", "1", "qwen", True
+            ),
+            implementation_max_continuations=1,
+        )
+        plan = make_plan(tasks=(task,))
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "opencode_max_steps_summary_remaining.jsonl"
+        )
+        step_limit_stdout = fixture.read_text(encoding="utf-8")
+        session_id = "session-summary-remaining"
+        done_stdout = json.dumps(
+            {
+                "type": "text",
+                "sessionID": session_id,
+                "part": {"type": "text", "text": "implementation complete"},
+            }
+        )
+
+        class Process:
+            pid = 41243
+            returncode = 0
+
+            def __init__(self, stdout, stderr=""):
+                self.stdout = stdout
+                self.stderr = stderr
+
+            def communicate(self, timeout=None):
+                return self.stdout, self.stderr
+
+        commands: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command and command[0] == "opencode-stub":
+                commands.append(list(command))
+                if "--session" in command:
+                    worktree = Path(command[command.index("--dir") + 1])
+                    path = worktree / task.expected_outputs[0]
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("completed by continuation\n", encoding="utf-8")
+                    return Process(done_stdout)
+                return Process(step_limit_stdout)
+            return real_popen(command, **kwargs)
+
+        adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+        router = AdapterRouter(
+            {"lmstudio": adapter, "fake": FakeAdapter(responder=approved_response)}
+        )
+        runner = Runner(self.database, router, self.workspace)
+        authorization = issue_authorization(plan)
+        with mock.patch("subprocess.Popen", side_effect=popen):
+            result = runner.start(plan, authorization, run_id="real-summary-cont-run")
+
+        self.assertEqual(RunState.COMPLETED, result.state)
+
+        rows = self._calls("implementation")
+        self.assertEqual([0, 1], [row["segment_index"] for row in rows])
+        self.assertEqual(rows[0]["call_id"], rows[1]["continuation_of_call_id"])
+        self.assertEqual(session_id, rows[0]["provider_request_id"])
+        self.assertEqual(session_id, rows[1]["continuation_session_id"])
+        self.assertEqual(InvocationState.FAILED.value, rows[0]["state"])
+        self.assertEqual(InvocationState.COMPLETED.value, rows[1]["state"])
+
+        base_metadata = json.loads(
+            self.database.fetch_one(
+                "SELECT raw_metadata_json FROM model_calls WHERE segment_index = 0 "
+                "AND role = 'implementation'"
+            )["raw_metadata_json"]
+        )
+        self.assertEqual("step_limit_reached", base_metadata["failure_kind"])
+        self.assertEqual("final_text", base_metadata["termination_source"])
+        self.assertEqual(
+            "step_limit_with_work_remaining_summary",
+            base_metadata["matched_rule_id"],
+        )
+
+        scheduled = [
+            event
+            for event in self.database.event_rows("real-summary-cont-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual(1, len(scheduled))
+        self.assertEqual(1, json.loads(scheduled[0]["payload_json"])["segment_index"])
+
+        self.assertEqual(
+            1,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM test_results")[
+                "count"
+            ],
+        )
+        self.assertEqual(
+            1,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+
+    def test_suspected_step_limit_pauses_without_continuation(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationIncompleteError(
+                    "unrecognized step-limit suffix",
+                    InvocationResult(
+                        "fake-suspected",
+                        (
+                            "Maximum steps for this agent have been reached. "
+                            "Tools are disabled until the next user input."
+                        ),
+                        11,
+                        5,
+                        2,
+                        37,
+                        0,
+                        {"test_double": True},
+                    ),
+                    failure_kind="suspected_step_limit",
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        authorization = issue_authorization(plan)
+        result = runner.start(plan, authorization, run_id="suspected-run")
+
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM model_calls WHERE segment_index >= 1"
+            )["count"],
+        )
+        scheduled = [
+            event
+            for event in self.database.event_rows("suspected-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual([], scheduled)
+        self.assertEqual(
+            0,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM test_results")[
+                "count"
+            ],
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+        checkpoint = json.loads(
+            self.database.run_snapshot("suspected-run")["run"]["checkpoint_json"]
+        )
+        self.assertEqual("suspected_step_limit", checkpoint["reason"])
+        call = self.database.fetch_one(
+            "SELECT state, raw_metadata_json FROM model_calls WHERE role = 'implementation'"
+        )
+        self.assertEqual(InvocationState.FAILED.value, call["state"])
+        self.assertEqual(
+            "suspected_step_limit",
+            json.loads(call["raw_metadata_json"])["failure_kind"],
+        )
+
+    def test_resume_suspected_step_limit_is_blocked_without_adapter_call(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationIncompleteError(
+                    "unrecognized step-limit suffix",
+                    InvocationResult(
+                        "fake-suspected",
+                        (
+                            "Maximum steps for this agent have been reached. "
+                            "Tools are disabled until the next user input."
+                        ),
+                        11,
+                        5,
+                        2,
+                        37,
+                        0,
+                        {"test_double": True},
+                    ),
+                    failure_kind="suspected_step_limit",
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        paused = runner.start(plan, authorization, run_id="suspected-resume-run")
+        self.assertEqual(RunState.PAUSED, paused.state)
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+        snapshot = self.database.run_snapshot("suspected-resume-run")["run"]
+        self.assertEqual(ControlState.PAUSED.value, snapshot["control_state"])
+
+        with self.assertRaisesRegex(ValueError, "suspected step-limit"):
+            runner.resume("suspected-resume-run", plan, authorization)
+
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+        snapshot = self.database.run_snapshot("suspected-resume-run")["run"]
+        self.assertEqual(ControlState.PAUSED.value, snapshot["control_state"])
+        self.assertEqual(RunState.PAUSED.value, snapshot["run_state"])
+
     def test_step_limit_pauses_at_continuation_limit(self) -> None:
         task = replace(make_task("task-1"), implementation_max_continuations=1)
         plan = make_plan(tasks=(task,))

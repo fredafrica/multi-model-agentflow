@@ -6,11 +6,11 @@
 
 ## Current Phase
 
-里程碑 16 `REVIEW_PASSED`：完成 OpenCode 本地 implementation/revision 步骤耗尽的同会话分段续接，并关闭第二轮审核发现的两个 P1。调用启动通过 `BEGIN IMMEDIATE` 原子检查暂停状态、登记或复用 PLANNED 调用并转入 STARTED；恢复路径明确区分 base、continuation 和非法 PLANNED 元数据，精确复用原 call、request key、实际模型和 session。167 项标准库测试、compileall 与 `git diff --check` 全部通过。
+里程碑 18 `REVIEW_PASSED`：修复真实 OpenCode 同行“步骤耗尽 + Markdown 摘要引导语”的识别，对未知后缀采用可审计的安全暂停，并统一所有合法裸标记变体和词边界。Codex 独立复核并补充句点无空格的后缀边界；193 项测试、compileall、修改文件 Ruff 和 `git diff --check` 通过。
 
 ## Next Step
 
-真实远程 Reviewer 验证仍留待新的 AgentFlow plan、plan hash 展示和用户明确授权；本轮不执行收费 smoke test。
+核对 Market Intelligence Platform 现有 TASK-011 AgentFlow 计划哈希与历史授权；若与用户已批准的哈希完全一致，则使用本地 Qwen 3.8 27B 8-bit 新建真实长 Markdown 续接验证运行；任何计划变化都要重新展示哈希。
 
 ## Milestones
 
@@ -185,6 +185,17 @@
 - [x] Runner 经既有同会话 continuation 路径续接而非运行 deterministic tests 或开启新 revision；新增真实适配器替身回归证明 base 记步骤耗尽、产生 `continuation.scheduled`、同 session 递增 segment_index，第二段完成后才进入确定性测试；review/rereview 仍不续接
 - [x] 新增最小脱敏 fixture `opencode_max_steps_long.jsonl`，补齐 5 项回归测试（含负向）并复跑全套 172 项通过
 - [x] 修复 Codex 二轮 P1：`_line_is_step_limit_marker` 原先先 `re.sub` 剥离全部非字母数字再匹配，会把标题/加粗/斜体/行内代码/引号/列表包裹的终止短语误判为真实终止；改为对原始行做严格锚定的 `re.fullmatch`（`re.IGNORECASE`，仅容忍末尾句号与 CRITICAL 变体的 `-`/`–`/`—`），并新增 Markdown/引号包裹负向测试；全套 173 项通过
+
+### 里程碑 18：同行摘要引导语与疑似步骤耗尽分类
+
+**Status:** REVIEW_PASSED
+
+- [x] 只对两个真实观测到的同行摘要引导语做严格整行白名单匹配，不使用宽泛 `startswith` 或任意 summary 后缀
+- [x] 步数与 `step_finish.reason` 仅作诊断元数据，不单独判定终止；高置信命中仍走同 session continuation
+- [x] 所有已接受的裸标记变体共用一套语法，非白名单后缀进入 `suspected_step_limit` 安全暂停，恢复前不重复调用 adapter
+- [x] 修复 `reachedness`/`reached123`/`reached_value` 词边界误报，并补充句点已构成边界但后缀无空格的疑似路径
+- [x] `terminal_reason` 明确为最后一个带 reason 的 `step_finish`；新增真实脱敏 fixture 与 parser/Runner 回归
+- [x] Codex 独立运行 193 项测试、compileall、修改文件 Ruff 与 `git diff --check`，未发现剩余 P0/P1
 
 ## Decisions Made
 

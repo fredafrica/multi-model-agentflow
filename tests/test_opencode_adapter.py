@@ -415,6 +415,407 @@ class OpenCodeAdapterTests(unittest.TestCase):
                     ).output,
                 )
 
+    def test_parser_recognizes_summary_remaining_step_limit_format(self) -> None:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "opencode_max_steps_summary_remaining.jsonl"
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(
+                fixture.read_text(encoding="utf-8"),
+                duration_ms=50,
+                is_local=False,
+            )
+        result = raised.exception.result
+        self.assertEqual("step_limit_reached", raised.exception.failure_kind)
+        self.assertEqual("session-summary-remaining", result.provider_request_id)
+        self.assertEqual("final_text", result.raw_metadata["termination_source"])
+        self.assertEqual(
+            "step_limit_with_work_remaining_summary",
+            result.raw_metadata["matched_rule_id"],
+        )
+        self.assertIn(
+            "Here is a summary of the work done and remaining tasks:",
+            result.raw_metadata["matched_line"],
+        )
+        self.assertIn("## Summary of Work Done", result.output)
+        self.assertIn("## Remaining Tasks", result.output)
+
+    def test_parser_recognizes_summary_completed_step_limit_format(self) -> None:
+        fixture = (
+            Path(__file__).parent
+            / "fixtures"
+            / "opencode_max_steps_summary_completed.jsonl"
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(
+                fixture.read_text(encoding="utf-8"),
+                duration_ms=50,
+                is_local=False,
+            )
+        result = raised.exception.result
+        self.assertEqual("step_limit_reached", raised.exception.failure_kind)
+        self.assertEqual("session-summary-completed", result.provider_request_id)
+        self.assertEqual("final_text", result.raw_metadata["termination_source"])
+        self.assertEqual(
+            "step_limit_with_work_completed_summary",
+            result.raw_metadata["matched_rule_id"],
+        )
+        self.assertIn("## Summary of Work Completed", result.output)
+
+    def test_summary_step_limit_format_with_crlf_is_recognized(self) -> None:
+        text = (
+            "Maximum steps for this agent have been reached. "
+            "Here is a summary of the work done and remaining tasks:\r\n"
+            "\r\n"
+            "## Summary of Work Done\r\n"
+            "- Inspected the implementation.\r\n"
+        )
+        event = json.dumps(
+            {"type": "text", "sessionID": "s", "part": {"type": "text", "text": text}}
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(event, duration_ms=1, is_local=True)
+        self.assertEqual("step_limit_reached", raised.exception.failure_kind)
+        self.assertEqual(
+            "step_limit_with_work_remaining_summary",
+            raised.exception.result.raw_metadata["matched_rule_id"],
+        )
+
+    def test_summary_step_limit_with_reason_stop_is_recognized(self) -> None:
+        events = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {
+                            "type": "text",
+                            "text": (
+                                "Maximum steps for this agent have been reached. "
+                                "Here's a summary of the work completed and remaining:"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {
+                            "type": "step-finish",
+                            "reason": "stop",
+                            "tokens": {"input": 1, "output": 1},
+                        },
+                    }
+                ),
+            )
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(events, duration_ms=1, is_local=True)
+        self.assertEqual("step_limit_reached", raised.exception.failure_kind)
+        self.assertEqual(
+            "stop", raised.exception.result.raw_metadata["terminal_reason"]
+        )
+
+    def test_summary_step_limit_with_event_counts_not_32_is_recognized(self) -> None:
+        events = "\n".join(
+            (
+                json.dumps({"type": "step_start", "part": {}}),
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {
+                            "type": "text",
+                            "text": (
+                                "Maximum steps for this agent have been reached. "
+                                "Here is a summary of the work done and remaining tasks:"
+                            ),
+                        },
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {
+                            "type": "step-finish",
+                            "reason": "stop",
+                            "tokens": {"input": 1, "output": 1},
+                        },
+                    }
+                ),
+            )
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(events, duration_ms=1, is_local=True)
+        metadata = raised.exception.result.raw_metadata
+        self.assertEqual("step_limit_reached", raised.exception.failure_kind)
+        self.assertEqual(1, metadata["step_start_count"])
+        self.assertEqual(1, metadata["step_finish_count"])
+
+    def test_configured_step_limit_is_recorded_in_metadata(self) -> None:
+        event = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "s",
+                "part": {
+                    "type": "text",
+                    "text": "Maximum steps for this agent have been reached.",
+                },
+            }
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(
+                event, duration_ms=1, is_local=True, configured_step_limit=32
+            )
+        self.assertEqual(
+            32, raised.exception.result.raw_metadata["configured_step_limit"]
+        )
+        self.assertEqual(
+            "2", raised.exception.result.raw_metadata["classifier_version"]
+        )
+
+    def test_summary_step_limit_marker_wrapped_in_markdown_is_not_termination(self) -> None:
+        markers = (
+            "Maximum steps for this agent have been reached. Here is a summary of the work done and remaining tasks:",
+            "Maximum steps for this agent have been reached. Here's a summary of the work completed and remaining:",
+        )
+        wrapped = []
+        for marker in markers:
+            wrapped.extend(
+                (
+                    f"## {marker}",
+                    f"**{marker}**",
+                    f"*{marker}*",
+                    f"`{marker}`",
+                    f'"{marker}"',
+                    f"'{marker}'",
+                    f"* {marker}",
+                )
+            )
+        for output in wrapped:
+            with self.subTest(output=output):
+                event = json.dumps(
+                    {"type": "text", "part": {"type": "text", "text": output}}
+                )
+                self.assertEqual(
+                    output,
+                    parse_opencode_json(
+                        event, duration_ms=1, is_local=True
+                    ).output,
+                )
+
+    def test_summary_step_limit_marker_in_code_quote_or_diff_is_not_termination(self) -> None:
+        marker = (
+            "Maximum steps for this agent have been reached. "
+            "Here is a summary of the work done and remaining tasks:"
+        )
+        outputs = (
+            f"```text\n{marker}\n```",
+            f"> {marker}",
+            f"+{marker}",
+        )
+        for output in outputs:
+            with self.subTest(output=output):
+                event = json.dumps(
+                    {"type": "text", "part": {"type": "text", "text": output}}
+                )
+                self.assertEqual(
+                    output,
+                    parse_opencode_json(
+                        event, duration_ms=1, is_local=True
+                    ).output,
+                )
+
+    def test_summary_step_limit_phrase_in_middle_of_sentence_is_not_termination(self) -> None:
+        output = (
+            "The worker logged the notice: Maximum steps for this agent have been "
+            "reached. Here is a summary of the work done and remaining tasks: and "
+            "then it kept going."
+        )
+        event = json.dumps(
+            {"type": "text", "part": {"type": "text", "text": output}}
+        )
+        self.assertEqual(
+            output,
+            parse_opencode_json(event, duration_ms=1, is_local=True).output,
+        )
+
+    def test_bare_marker_with_unrecognized_suffix_is_suspected(self) -> None:
+        output = (
+            "Maximum steps for this agent have been reached. "
+            "Tools are disabled until the next user input.\n"
+        )
+        event = json.dumps(
+            {"type": "text", "sessionID": "s", "part": {"type": "text", "text": output}}
+        )
+        with self.assertRaises(InvocationIncompleteError) as raised:
+            parse_opencode_json(event, duration_ms=1, is_local=True)
+        self.assertEqual("suspected_step_limit", raised.exception.failure_kind)
+        metadata = raised.exception.result.raw_metadata
+        self.assertEqual("final_text", metadata["termination_source"])
+        self.assertEqual(
+            "unrecognized_step_limit_suffix", metadata["matched_rule_id"]
+        )
+
+    def test_any_legal_bare_marker_with_unapproved_suffix_is_suspected(self) -> None:
+        suffix = "Unknown suffix"
+        variants = (
+            "The maximum number of steps for this agent has been reached. {suffix}",
+            "the maximum number of steps for this agent has been reached. {suffix}",
+            "Maximum steps for this agent have been reached. {suffix}",
+            "The maximum steps for this agent has been reached. {suffix}",
+            "max number of steps for this agent were reached. {suffix}",
+            "maximum steps for this agent was reached. {suffix}",
+            "CRITICAL — MAXIMUM STEPS REACHED. {suffix}",
+            "critical - maximum steps reached. {suffix}",
+            "CRITICAL — MAX STEPS REACHED. {suffix}",
+        )
+        for marker in variants:
+            with self.subTest(marker=marker):
+                text = marker.format(suffix=suffix)
+                event = json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {"type": "text", "text": text},
+                    }
+                )
+                with self.assertRaises(InvocationIncompleteError) as raised:
+                    parse_opencode_json(event, duration_ms=1, is_local=True)
+                self.assertEqual("suspected_step_limit", raised.exception.failure_kind)
+                metadata = raised.exception.result.raw_metadata
+                self.assertEqual("final_text", metadata["termination_source"])
+                self.assertEqual(
+                    "unrecognized_step_limit_suffix", metadata["matched_rule_id"]
+                )
+
+    def test_marker_period_is_a_suffix_boundary_without_following_space(self) -> None:
+        variants = (
+            "Maximum steps for this agent have been reached.Unknown suffix",
+            "The maximum number of steps for this agent has been reached.Unknown suffix",
+            "CRITICAL — MAXIMUM STEPS REACHED.Unknown suffix",
+        )
+        for output in variants:
+            with self.subTest(output=output):
+                event = json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {"type": "text", "text": output},
+                    }
+                )
+                with self.assertRaises(InvocationIncompleteError) as raised:
+                    parse_opencode_json(event, duration_ms=1, is_local=True)
+                self.assertEqual("suspected_step_limit", raised.exception.failure_kind)
+
+    def test_marker_immediately_followed_by_word_char_is_not_termination(self) -> None:
+        outputs = (
+            "Maximum steps for this agent have been reachedness is not a marker",
+            "Maximum steps for this agent have been reached123 is not a marker",
+            "Maximum steps for this agent have been reached_value is not a marker",
+        )
+        for output in outputs:
+            with self.subTest(output=output):
+                event = json.dumps(
+                    {"type": "text", "part": {"type": "text", "text": output}}
+                )
+                self.assertEqual(
+                    output,
+                    parse_opencode_json(event, duration_ms=1, is_local=True).output,
+                )
+
+    def test_terminal_reason_reflects_last_defined_step_finish_reason(self) -> None:
+        text = json.dumps(
+            {"type": "text", "sessionID": "s", "part": {"type": "text", "text": "done"}}
+        )
+        first = json.dumps(
+            {"type": "step_finish", "part": {"type": "step-finish", "reason": "tool_use"}}
+        )
+        second = json.dumps(
+            {"type": "step_finish", "part": {"type": "step-finish", "reason": "stop"}}
+        )
+        events = "\n".join((text, first, second))
+        result = parse_opencode_json(events, duration_ms=1, is_local=True)
+        self.assertEqual("stop", result.raw_metadata["terminal_reason"])
+
+        no_reason_last = json.dumps(
+            {
+                "type": "step_finish",
+                "part": {"tokens": {"input": 1, "output": 1}},
+            }
+        )
+        events_without_final_reason = "\n".join((text, first, no_reason_last))
+        result = parse_opencode_json(
+            events_without_final_reason, duration_ms=1, is_local=True
+        )
+        self.assertEqual("tool_use", result.raw_metadata["terminal_reason"])
+
+    def test_event_count_without_marker_is_not_step_limit(self) -> None:
+        events = "\n".join(
+            (json.dumps({"type": "step_start", "part": {}}),) * 32
+            + (
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {"type": "text", "text": "done"},
+                    }
+                ),
+            )
+        )
+        result = parse_opencode_json(events, duration_ms=1, is_local=True)
+        self.assertEqual("done", result.output)
+        self.assertEqual(32, result.raw_metadata["step_start_count"])
+
+    def test_reason_stop_without_marker_is_not_step_limit(self) -> None:
+        events = "\n".join(
+            (
+                json.dumps(
+                    {
+                        "type": "text",
+                        "sessionID": "s",
+                        "part": {"type": "text", "text": "implementation complete"},
+                    }
+                ),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {
+                            "type": "step-finish",
+                            "reason": "stop",
+                            "tokens": {"input": 1, "output": 1},
+                        },
+                    }
+                ),
+            )
+        )
+        result = parse_opencode_json(events, duration_ms=1, is_local=True)
+        self.assertEqual("implementation complete", result.output)
+        self.assertEqual("stop", result.raw_metadata["terminal_reason"])
+
+    def test_marker_not_fabricated_across_unrelated_text_events(self) -> None:
+        head = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "s",
+                "part": {"type": "text", "text": "Maximum steps for this agent "},
+            }
+        )
+        tail = json.dumps(
+            {
+                "type": "text",
+                "sessionID": "s",
+                "part": {"type": "text", "text": "have been reached."},
+            }
+        )
+        events = f"{head}\n{tail}"
+        result = parse_opencode_json(events, duration_ms=1, is_local=True)
+        self.assertEqual(
+            "Maximum steps for this agent have been reached.", result.output
+        )
+
     def test_read_only_permissions_deny_edits_and_external_access(self) -> None:
         permission = OpenCodeAdapter._permission_config(read_only=True)["permission"]
         self.assertEqual("deny", permission["edit"])

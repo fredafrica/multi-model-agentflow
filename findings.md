@@ -98,3 +98,10 @@
 - 二轮 Codex Review 发现 `_line_is_step_limit_marker` 先用 `re.sub(r"[^a-z0-9]+", " ", line.lower())` 删除标点再匹配，会把标题、加粗/斜体、行内代码、单/双引号和列表包裹的终止短语误判为真实终止并错误触发 continuation。
 - 修复：改为对原始行严格锚定 `re.fullmatch`（`re.IGNORECASE`），仅容忍末尾句号与 CRITICAL 变体的 `-`/`–`/`—` 连字符；不再通过删除所有标点把引用/标题/强调/行内代码/列表折叠成合法标记。fenced code、blockquote、diff、缩进与行内散文的既有误报防护保持不变。
 - 新增负向测试 `test_step_limit_marker_wrapped_in_markdown_or_quotes_is_not_termination`，覆盖 `## `、`**`、`*`、`` ` ``、`"`、`'` 与 `* ` 列表包裹。全套 173 项测试通过，compileall 与 `git diff --check` 退出码 0。未改动 continuation、授权、预算、数据库或远程 Reviewer 逻辑。
+
+## 里程碑 18：同行摘要与安全降级
+
+- 真实终止样本可以把步骤耗尽标记和摘要引导语放在同一行；最小安全修复是只允许已观测到的两个完整行，不将事件计数或 `reason=stop` 升级为终止判据。
+- 疑似路径必须与裸标记共用语法，否则 `The maximum number ...` 和 CRITICAL 变体带未知后缀时仍会被静默判完成。
+- 标记主体后必须校验词边界；紧跟字母、数字或下划线不是标记，而句点等标点已构成后缀边界，即使其后没有空格也应安全降级为 `suspected_step_limit`。
+- 对于无法自动认证的未知后缀，安全性优先于吞吐量：不自动 continuation、不误报 completed，且 resume 前置阻断确保不重复调用模型。
