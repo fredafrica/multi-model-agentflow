@@ -50,7 +50,10 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 等待优先消费进程、文件或任务状态事件；无事件接口时由非 LLM 程序检查；最终后备才采用指数退避。
 - 支持安全暂停、立即冻结、人工接管和恢复。一次外部进程或模型请求是安全暂停的最小不可中断单元；返回后在下一次调用前保存检查点。
 - 重启恢复执行幂等检查：已完成任务和已完成收费调用不重复。
-- 步骤上限耗尽作为带原因的已知失败，保留 Token、耗时和已确认费用；实施结果不进入自测/审核，Reviewer 结果不产生 review 记录，两者均安全暂停且不自动重试。
+- 步骤上限耗尽作为带原因的已知失败，保留 Token、耗时和已确认费用；实施结果不进入自测/审核，Reviewer 结果不产生 review 记录，两者均安全暂停且不自动重试。无论进程退出码为 0 还是正数非零，只要 stdout 事件流包含严格步骤耗尽信号即按此处理；signal 终止或结果不可确认仍保持 `UNKNOWN`。
+- 本地实施任务通过任务合同的 `implementation_max_steps` 字段携带有限步骤预算（缺省 8，允许 1–32，进入计划哈希与授权）。远程 Reviewer 继续使用独立的固定安全步骤上限，不因该字段放宽。
+- 本地实施任务通过任务合同的 `implementation_timeout_seconds` 字段携带墙钟超时（缺省 900，允许 60–14400，进入计划哈希与授权）。超时后终止进程组并记为 `UNKNOWN`，保留部分输出中已确认的 Token、耗时与 OpenCode 会话 ID 等审计证据，`output_text` 保持空且不自动重试/自测/审核。
+- 本地实施任务通过任务合同的 `implementation_max_continuations` 字段携带续接预算（缺省 0，允许 0–8，进入计划哈希与授权）。本地 implementation/revision 调用因步骤耗尽而已知失败时，仅在本地模型、同一模型与 worktree/文件范围、续接限额内、文件范围核验通过且非 `UNKNOWN`/超时/signal/费用未知的前提下，以同一 OpenCode 会话的新 segment 续接；每个 segment 拥有唯一 call_id/request_key/segment_index/continuation_of_call_id 并单独记录 Token/耗时/费用，续接决定以 `continuation.scheduled` 事件持久化。远程只读 Reviewer 永不续接；segment 间进程重启后 resume 只续接一次且不重复已完成 segment。多轮修订由 `max_retry_count` 驱动（impl→test→fix→retest）。
 - 收费调用结果未知时先按请求 ID 查询；无法确认则进入 `UNKNOWN` 并暂停，不自动重试。
 - 人工修改后基于 Git 差异和文件哈希，只失效受影响结果。
 
@@ -114,15 +117,17 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 | MVP-A20 | 对 D0-D3 Review Packet、敏感字段、预算和独立性组合执行远程门禁。 | 只有计划/授权/隐私/预算/跨家族全部满足时进入替身；D2 未通过真实脱敏标志和 D3 始终拒绝。 | AUTH-09, PRIV-02, PRIV-07, QA-03 |
 | MVP-A21 | 解析有费用、无费用字段和结果未知的 OpenCode 替身响应。 | 已报告费用累计，缺失费用计为 `cost_unavailable`，UNKNOWN 不重试且恢复前必须处置。 | COST-05~06, STATE-03, STATE-05 |
 | MVP-A22 | 运行 canonical Skill 与 installed Skill 校验和哈希比对。 | 两者通过 quick_validate、逐文件内容一致，并保留 plan show → hash approval → authorize → start。 | AUTH-01, AUTH-09, PLAT-02 |
-| MVP-A23 | 用退出码 0 的 OpenCode 事件流分别模拟 implementation 和 review 步骤耗尽。 | 调用为带 `step_limit_reached` 原因的已知失败；implementation 不进入测试/审核，review 不生成 review row，两者保留使用/费用证据并暂停且不自动重试。 | QA-08, STATE-03, STATE-05 |
+| MVP-A23 | 用退出码为 0 或正数非零的 OpenCode 事件流分别模拟 implementation 和 review 步骤耗尽。 | 调用为带 `step_limit_reached` 原因的已知失败；implementation 不进入测试/审核，review 不生成 review row，两者保留使用/费用证据并暂停且不自动重试。 | QA-08, STATE-03, STATE-05 |
 | MVP-A24 | 对 Reviewer 返回纯 JSON、fenced JSON、散文包装、缺字段、错类型、非法 severity 与矛盾批准。 | 只有合规 JSON 生成 review row；非合规输出暂停，P0/P1 始终阻断批准。 | QA-06~09 |
 | MVP-A25 | 实施产生计划内未跟踪新文件，包括带空白错误的样例。 | 新文件进入文件范围、Review Packet 和存在性检查；补充检查可在 `git diff --check` 单独退出 0 时捕获未跟踪空白错误。 | GIT-05~06 |
+| MVP-A26 | 本地实施调用超过任务合同配置的超时上限。 | 进程组被终止，调用记为 `UNKNOWN` 并暂停；数据库保存已确认 Token、耗时、会话 ID 与 `termination_reason=timeout`/`token_source`/`usage_unavailable`，`output_text` 为空，resume 被阻止且不自动重试；重叠或缺失的部分输出不重复累计 Token、不伪造零费用。 | TASK-05, QA-10, STATE-03, STATE-05 |
+| MVP-A27 | 本地实施调用反复步骤耗尽，且续接预算配置为 0、1 或 2。 | 预算为 0 时安全暂停且 resume 被阻止；预算 ≥1 时以 `--session` 在同一 OpenCode 会话内续接并最终完成，每个 segment 的 call/request_key/segment_index/continuation_of_call_id 唯一且单独记录 Token/耗时/费用；到达限额仍耗尽时暂停且 resume 不重复调用；远程 Reviewer、`UNKNOWN`、超时、signal、越界文件、缺失会话 ID 的场景不续接。 | TASK-06, QA-11, STATE-03, STATE-05 |
 
 ## 5. MVP 完成定义
 
 同时满足以下条件才算 MVP 通过：
 
-1. MVP-A01 至 MVP-A25 全部通过，且每项有非模型自述的可核查证据。
+1. MVP-A01 至 MVP-A27 全部通过，且每项有非模型自述的可核查证据。
 2. 没有未解决的 P0/P1 审核问题。
 3. 通用核心没有硬编码候选模型或金融规则。
 4. 未包含“明确不做”列表中的能力作为隐含依赖。
@@ -139,7 +144,7 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 
 ## 7. 验收结果
 
-MVP-A01 至 MVP-A25 均已通过。当前自动化证据由 98 项标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider 调用或 smoke test，远程费用为 0。历史本地适配器验证保持不变。
+MVP-A01 至 MVP-A27 均已通过。当前自动化证据由 167 项标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider smoke test，远程费用为 0。历史本地适配器验证保持不变。
 
 | 场景 | 结果 | 主要证据 |
 | --- | --- | --- |
@@ -168,3 +173,5 @@ MVP-A01 至 MVP-A25 均已通过。当前自动化证据由 98 项标准库测�
 | MVP-A23 | 通过 | 近真实 JSONL fixture、结构化/文本终止标记、implementation/review 暂停及费用/恢复测试 |
 | MVP-A24 | 通过 | JSON-only prompt、严格字段/类型/severity 解析、非合规暂停与 P0/P1 阻断测试 |
 | MVP-A25 | 通过 | 未跟踪文件范围、Review Packet、expected output 与补充空白错误测试 |
+| MVP-A26 | 通过 | 本地实施超时的进程组终止、`UNKNOWN` 持久化（Token/耗时/会话/termination_reason/token_source/usage_unavailable）、空 `output_text`、resume 阻止与重叠输出不重复计数测试 |
+| MVP-A27 | 通过 | 本地实施步骤耗尽的同会话分段续接、限额暂停、session 复用、越界/缺失会话/远程/UNKNOWN 不续接、segment 间进程重启只续接一次与多轮修订测试 |

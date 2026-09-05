@@ -116,6 +116,9 @@ max_remote_cost:
 max_retry_count:
 escalation_conditions:
 expected_outputs:
+implementation_max_steps:
+implementation_timeout_seconds:
+implementation_max_continuations:
 ```
 
 其中 `risk_level` 是包含 `business_importance` 与 `operational_safety` 的对象，分别使用 AD-25 确定的 B0-B3 与 S0-S3 枚举。
@@ -125,6 +128,9 @@ expected_outputs:
 | TASK-01 | 确定性程序应负责日期、计算、格式、风险分数和可自动判定的测试。 | 可确定结果不需要模型自由判断。 |
 | TASK-02 | 本地或便宜模型应优先处理批量、机械、边界明确工作；中等模型处理普通实现和审核；强模型保留给关键规划、复杂故障、冲突裁决和最终 P0 审核。 | 路由理由符合任务属性；强模型不会默认承担全部实现。 |
 | TASK-03 | 实施模型、审核模型、后备模型及费用、重试、升级边界必须在执行前进入任务合同。 | 缺失必填字段的任务不能进入执行状态。 |
+| TASK-04 | 本地实施任务必须携带有限正整数步骤预算字段 `implementation_max_steps`，进入任务合同与计划哈希；旧计划未提供时默认 8，允许范围为 1–32。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务显式配置 12–16 等预算；越界、非整数或负值在构造/解析时被拒绝；改变预算后旧授权不能授权修改后的计划。 |
+| TASK-05 | 本地实施任务必须携带整数超时字段 `implementation_timeout_seconds`，进入任务合同与规范化 JSON/计划哈希；旧计划未提供时默认 900，允许范围为 60–14400。布尔、字符串、浮点数、0、负数及越界值在构造或解析时被拒绝。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务显式配置更长超时；`plan show` 展示该字段；越界或错误类型被拒绝；改变超时后旧授权不能授权修改后的计划。 |
+| TASK-06 | 本地实施任务必须携带非负整数续接预算字段 `implementation_max_continuations`，进入任务合同、规范化 JSON 与计划哈希；旧计划未提供时默认 0，允许范围为 0–8，0 表示步骤耗尽后不续接。布尔、字符串、非整型浮点、负数及越界值在构造或解析时被拒绝。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务可显式配置续接次数；`plan show` 展示该字段；越界或错误类型被拒绝；改变续接预算后旧授权不能授权修改后的计划。 |
 
 ## 10. 质量门禁
 
@@ -137,7 +143,9 @@ expected_outputs:
 | QA-05 | 审核输入应优先包括原始需求、验收标准、代码差异、测试和原始证据，避免用实施模型的长篇说明锚定审核者。 | 审核上下文清单可检查。 |
 | QA-06 | P0 必须覆盖越权、隐私泄露、数据破坏、重复收费和关键结论错误；P1 必须覆盖未满足验收标准、明显回归和恢复失败。P0/P1 均阻断批准，P2/P3 为非阻断改进。 | 任一未关闭 P0/P1 都使批准失败；P2/P3 保留在审核记录中。 |
 | QA-07 | 远程 Reviewer 必须强制只读并禁用编辑、写入、Shell、外部目录、网页工具、任务/子 Agent、Skill 和交互升级；输出必须解析为含 `approved` 与结构化 findings（severity、title、explanation 及适用的 path/remediation）的结果。 | 权限配置和解析测试覆盖全部禁止能力；未解决 P0/P1 或无法确认的输出均不能批准。 |
-| QA-08 | 模型调用的步骤上限耗尽或其他已知输出不完整终止必须记为带类型原因的已知失败，不得记为 `completed`、`UNKNOWN` 或有效实施/审核结果。必须保留已确认 Token、耗时和费用，在下一质量节点前安全暂停，且不得自动重试。 | 退出码为 0 但事件/最终文本显示步骤耗尽时，实施不进入自测/审核，Reviewer 不生成 review 记录；暂停原因和调用证据可审计，resume 不会重复调用。 |
+| QA-08 | 模型调用的步骤上限耗尽或其他已知输出不完整终止必须记为带类型原因的已知失败，不得记为 `completed`、`UNKNOWN` 或有效实施/审核结果。必须保留已确认 Token、耗时和费用，在下一质量节点前安全暂停，且不得自动重试。 | 无论退出码为 0 还是正数非零退出，只要 stdout 事件/最终文本显示严格步骤耗尽，实施不进入自测/审核，Reviewer 不生成 review 记录；暂停原因和调用证据可审计，resume 不会重复调用。由 signal 终止或结果不可确认的调用仍保持 `UNKNOWN`，不得仅凭不完整文本改为已知失败。 |
+| QA-10 | 本地实施调用超过 `implementation_timeout_seconds` 时必须终止进程组并记为 `UNKNOWN`，不得自动进入自测、审核、重试或完成；必须保留部分 stdout 中已确认的 Token、耗时、OpenCode 会话 ID 及结构化审计元数据，同时诚实记录 `usage_unavailable` 与 `token_source`。部分输出不得当作可信 `output_text`；原始元数据只保存最小必要字段，并以 SHA-256 记录部分 stdout 哈希。 | 模拟超时后调用终态为 `UNKNOWN`，暂停原因为 `unknown_model_call`，resume 被阻止；数据库保存 Token/耗时/会话 ID/`termination_reason=timeout`/`token_source`；无可用 Token 时 `usage_unavailable=true` 且不伪造零费用；`output_text` 为空；重复或重叠的部分输出不会重复累计 Token。 |
+| QA-11 | 本地实施/修订角色调用因步骤上限耗尽而已知失败时，仅当全部条件满足（本地模型、实施/修订角色、同一模型与 worktree/文件范围、`implementation_max_continuations` 限额内、文件范围核验通过、无暂停/取消/接管、非 `UNKNOWN`/超时/signal/费用未知）才可在同一 OpenCode 会话内以新 segment 续接；每个 segment 拥有唯一 call_id、request_key、segment_index 与 continuation_of_call_id，并单独记录 Token、耗时与费用；续接决定必须持久化为 `continuation.scheduled` 事件，segment 间进程重启后 resume 必须只续接一次且不重复已完成 segment。任一条件不满足时必须保持安全暂停且不得续接或重试。 | 步骤耗尽后实施在限额内以 `--session` 复用同一 OpenCode 会话继续并最终完成；远程 Reviewer、`UNKNOWN`、超时、signal、越界文件、缺失会话 ID 或超过限额的场景保持暂停且 resume 不产生重复调用；续接 segment 的调用记录与 `continuation.scheduled` 事件可审计。 |
 | QA-09 | Reviewer 提示必须在 Review Packet 之外强制 JSON-only 协议：只允许一个顶层对象，`approved` 必须是 boolean，`findings` 必须是数组，每项必须有 P0-P3 `severity`、字符串 `title` 和 `explanation`，可选字符串 `path`/`remediation`。Markdown fence、前后散文、缺字段、错类型或非法严重度均不得猜测性解析；任一 P0/P1 必须覆盖 `approved=true`。 | 有效纯 JSON 产生正式 review 记录；所有非合规样例安全暂停且不得批准。 |
 
 ## 11. Git 隔离与并发

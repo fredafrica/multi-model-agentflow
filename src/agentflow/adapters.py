@@ -11,9 +11,16 @@ from .contracts import InvocationRequest, InvocationResult, ModelRecord
 class InvocationOutcomeUnknown(RuntimeError):
     """The request may have reached the provider, so retrying could duplicate cost."""
 
-    def __init__(self, message: str, provider_request_id: str | None = None) -> None:
+    def __init__(
+        self,
+        message: str,
+        provider_request_id: str | None = None,
+        *,
+        result: InvocationResult | None = None,
+    ) -> None:
         super().__init__(message)
         self.provider_request_id = provider_request_id
+        self.result = result
 
 
 class InvocationIncompleteError(RuntimeError):

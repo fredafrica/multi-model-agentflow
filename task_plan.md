@@ -2,15 +2,15 @@
 
 ## Goal
 
-修复 OpenCode 调用的有限步骤预算、不完整调用状态、严格 Reviewer JSON 协议与未跟踪输出证据边界，完成无费用回归验证、离线构建和 canonical/installed Skill 同步。
+修复 OpenCode 本地 implementation 调用的固定总超时问题，以及超时后 Token/审计元数据丢失的问题；新增 `implementation_timeout_seconds` 计划字段，完成无费用回归验证、离线构建和 canonical/installed Skill 同步。
 
 ## Current Phase
 
-里程碑 13 完成：离线构建、隔离安装验证和 canonical/installed Skill 同步均已通过。
+里程碑 16 `REVIEW_PASSED`：完成 OpenCode 本地 implementation/revision 步骤耗尽的同会话分段续接，并关闭第二轮审核发现的两个 P1。调用启动通过 `BEGIN IMMEDIATE` 原子检查暂停状态、登记或复用 PLANNED 调用并转入 STARTED；恢复路径明确区分 base、continuation 和非法 PLANNED 元数据，精确复用原 call、request key、实际模型和 session。167 项标准库测试、compileall 与 `git diff --check` 全部通过。
 
 ## Next Step
 
-真实远程 Reviewer 验证留待新的 AgentFlow plan、plan hash 展示和用户明确授权；本轮不执行收费 smoke test。
+真实远程 Reviewer 验证仍留待新的 AgentFlow plan、plan hash 展示和用户明确授权；本轮不执行收费 smoke test。
 
 ## Milestones
 
@@ -134,6 +134,58 @@
 - [x] 验证 canonical/installed Skill 一致并记录 SHA-256
 - [x] 运行安装后静态无费用自检，不执行真实 Reviewer smoke test
 
+### 里程碑 14：非零退出步骤耗尽修复与步骤预算字段
+
+**Status:** complete
+
+- [x] 修复 OpenCode 本地与远程 Reviewer 非零退出时先解析 stdout 严格步骤耗尽信号再分类
+- [x] 本地 signal 终止保持 `InvocationOutcomeUnknown`，不降级为已知失败
+- [x] 已知失败经 `fail_call` 保存 provider/session ID、Token、耗时、费用与 `termination_source`
+- [x] Runner 在 implementation/review 边界分别暂停并拒绝 resume 重复调用
+- [x] 新增任务合同字段 `implementation_max_steps`（缺省 8，1–32），进入计划哈希与授权
+- [x] OpenCodeAdapter 从请求元数据读取并验证预算后写入 `agentflow-sandbox` 的 `steps`
+- [x] 补齐本地/远程非零退出、普通错误、signal、Runner 真实适配器与预算字段回归测试
+
+### 里程碑 15：本地实施调用超时与审计元数据保留
+
+**Status:** complete
+
+- [x] 新增任务合同字段 `implementation_timeout_seconds`（缺省 900，60–14400），进入规范化 JSON 与计划哈希；布尔/字符串/浮点/越界值被拒绝
+- [x] OpenCodeAdapter 从请求元数据读取并验证超时后用于本地 `communicate(timeout=...)`，取代固定 900 秒
+- [x] 超时后终止进程组、在原始字节层合并 `TimeoutExpired.output` 与后续输出（UTF-8 多字节截断安全），保守解析部分 stdout 中已确认 Token/会话 ID
+- [x] 以 `InvocationOutcomeUnknown(result=...)` 返回，服务层经 `mark_call_unknown` 持久化 `UNKNOWN` 终态与 Token/耗时/会话/`termination_reason=timeout`/`token_source`/`usage_unavailable`；`output_text` 保持空
+- [x] 部分输出重叠或重复不重复累计 Token：先在原始字节层统一并消除 `TimeoutExpired.output` 与后续 `communicate()` 输出的重叠，合并完成后只解码一次，再按每个真实出现的已完成 step 累加 Token；不得根据事件内容推断重复；无可用 usage 时诚实记录 `usage_unavailable`
+- [x] 完成 step 计数改用 `completed_step_count`，只统计 `step_finish`，不再同时统计 start/finish
+- [x] 正常完成路径 `parse_opencode_json` 同步由 max 改为累加，并补充 reasoning Token 提取
+- [x] 补齐契约、适配器、Runner 真实适配器与 CLI 回归测试，并同步文档与 Skill
+
+### 里程碑 16：本地实施步骤耗尽的同会话分段续接
+
+**Status:** REVIEW_PASSED
+
+- [x] 适配器识别真实 OpenCode 步骤耗尽文本 `Maximum steps for this agent have been reached.`（并保留既有变体与误报护栏），读取 `continuation_session_id` 元数据并追加 `opencode run --session <id>`
+- [x] 新增任务合同字段 `implementation_max_continuations`（缺省 0，0–8），进入规范化 JSON、计划哈希、授权与 `plan show`
+- [x] schema/model_calls 增加 `segment_index`、`continuation_of_call_id`、`continuation_session_id`，provider-request 唯一索引改为 `(provider, provider_request_id, segment_index)` 并在 `initialize()` 中幂等迁移
+- [x] Runner 以 `_drive_local_role` 在同一会话内分段续接本地 implementation/revision，`_continuation_allowed` 门禁（本地模型、实施/修订角色、续接限额内、有效会话 ID、文件范围）；越界文件在续接前终止任务
+- [x] 续接 segment 拥有唯一 call_id/request_key（`...:segment:{index}`）/segment_index/continuation_of_call_id，并单独记录 Token/耗时/费用；续接决定持久化为 `continuation.scheduled` 事件
+- [x] `max_retry_count` 驱动多轮修订（impl→test→fix→retest），修订提示词携带返回码、stdout/stderr 尾部、缺失输出、未跟踪空白错误、changed files 与剩余验收条件的有界证据
+- [x] resume 以 `_has_blocking_incomplete_call` 区分可续接与不可续接的步骤耗尽调用；segment 间进程重启后只续接一次且不重复已完成 segment
+- [x] 补齐契约、适配器、Runner、迁移回归测试，并同步 requirements/mvp/architecture-decisions 与 Skill
+- [x] 以 `BEGIN IMMEDIATE` 关闭暂停门禁与 continuation STARTED 之间的 TOCTOU 竞态
+- [x] 区分并安全恢复 base/continuation PLANNED；非法元数据在 adapter 调用前暂停
+- [x] Codex 独立复跑 167 项测试、compileall 与 `git diff --check`，Milestone 16 `REVIEW_PASSED`
+
+### 里程碑 17：真实步骤耗尽检测遗漏修复
+
+**Status:** complete
+
+- [x] 根因：真实 Qwen implementation/revision 输出把 `Maximum steps for this agent have been reached.` 作为“前缀推理文本 + `</think>` + 独立终止行 + 长 Markdown Summary”中的独立行，旧 `_text_reports_step_limit` 只检查首行或整段 `fullmatch`，导致两调用都被误记 `completed` 并错误进入 revision
+- [x] 改为逐行结构化扫描：跟踪 fenced code、跳过 blockquote/diff/缩进内容，仅匹配规范化后整行等于已接受终止标记（`maximum steps…have been reached` / `the maximum number of steps…` / `critical maximum steps reached`）的行，保留全部误报护栏
+- [x] 检测到真实终止后 `parse_opencode_json` 抛 `InvocationIncompleteError`（`failure_kind=step_limit_reached`、`termination_source=final_text`），保留 session ID、Token、费用、耗时与输出证据；退出码 0 与非 0 均正确分类
+- [x] Runner 经既有同会话 continuation 路径续接而非运行 deterministic tests 或开启新 revision；新增真实适配器替身回归证明 base 记步骤耗尽、产生 `continuation.scheduled`、同 session 递增 segment_index，第二段完成后才进入确定性测试；review/rereview 仍不续接
+- [x] 新增最小脱敏 fixture `opencode_max_steps_long.jsonl`，补齐 5 项回归测试（含负向）并复跑全套 172 项通过
+- [x] 修复 Codex 二轮 P1：`_line_is_step_limit_marker` 原先先 `re.sub` 剥离全部非字母数字再匹配，会把标题/加粗/斜体/行内代码/引号/列表包裹的终止短语误判为真实终止；改为对原始行做严格锚定的 `re.fullmatch`（`re.IGNORECASE`，仅容忍末尾句号与 CRITICAL 变体的 `-`/`–`/`—`），并新增 Markdown/引号包裹负向测试；全套 173 项通过
+
 ## Decisions Made
 
 | Date | Decision | Reason |
@@ -145,6 +197,8 @@
 | 2026-09-04 | 任务、控制和调用状态使用三个正交状态机 | 避免组合状态爆炸并隔离 UNKNOWN 调用 |
 | 2026-09-04 | 通过 OpenCode 增加计划限定的远程只读 Reviewer | Owner 明确扩大该项范围，但不放宽其他安全边界 |
 | 2026-09-04 | 远程 Reviewer 仅允许 review/rereview，实施与修改继续由本地主模型承担 | 保持职责隔离并限制远程副作用 |
+| 2026-09-04 | 本地实施超时改为计划字段控制，超时记为 `UNKNOWN` 并保留审计证据 | 避免固定 900 秒超时与超时后元数据丢失，且不把未确认结果当已知失败 |
+| 2026-09-05 | 本地实施/修订步骤耗尽时在同一 OpenCode 会话内以新 segment 分段续接，续接预算由计划字段 `implementation_max_continuations` 控制 | 修复固定 `steps` 预算耗尽即中止、无法在一个任务合同内继续的问题；续接非“自动重试”，仍在授权、文件范围与预算门禁内 |
 
 ## Errors Encountered
 
@@ -171,25 +225,48 @@
 | 未跟踪空白错误用例允许 1 次 revision，比预期多一次调用 | 里程碑 11 定向测试 | 将该边界用例的重试数设为 0，保持“门禁失败后不进入 Reviewer”的单一验证目标 |
 | 合并的 `apply_patch` 对 `task_plan.md` 含两个 Update File 段，校验器拒绝 | 里程碑 11 进度更新 | 将源码/测试和单一计划更新拆开后成功应用，没有部分写入 |
 | Runner 的真实步骤耗尽 fixture 回归仍断言旧手工费用 `0.25` | 本轮定向测试 | 改为断言 fixture 实际报告费用 `0.125`；生产检测与费用持久化逻辑无需修改 |
+| 独立验收发现超时路径 `TimeoutExpired.output` 为 `bytes`、后续 `communicate()` 返回 `str`，直接相加触发 TypeError 落入普通 FAILED | 独立验收 P1 | 新增 `_decode_partial_stdout` 统一解码，并用 `_merge_overlapping_output` 按重叠前缀合并两段输出 |
+| 独立验收发现 `max` 聚合会系统性少记多步骤 Token（真实会话 input 120156 vs max 34362） | 独立验收 P1 | 改为按每个真实出现的已完成 step 累加 Token，`parse_opencode_json` 与 `parse_opencode_partial_usage` 一并修复，并补充 reasoning 提取与 bytes/多步/重叠回归测试 |
+| 独立验收发现按 canonical JSON 内容去重会误删内容相同的独立 step，且 `step_count` 同时统计 start/finish | 独立验收 P1/P2 | 改为原始字节层重叠合并（`_merge_overlapping_output_bytes`）、去除事件内容去重，`step_count` 改为只统计 `step_finish` 的 `completed_step_count` |
+| 真实运行 `task011-agentflow-v2-20260905` 中 Qwen implementation/revision 的长输出（前缀文本 + `</think>` + 独立终止行 + Markdown Summary）被误记 `completed` | 本轮真实缺陷 | 改为逐行状态扫描检测独立未引用终止行，触发 `InvocationIncompleteError` 并走同会话 continuation；新增长摘要 fixture 与 5 项回归测试 |
+| Codex 二轮发现 `_line_is_step_limit_marker` 先剥离标点导致标题/加粗/斜体/行内代码/引号/列表包裹的终止短语被误判为真实终止 | 本轮 P1 | 改为对原始行严格锚定 `re.fullmatch`，仅容忍末尾句号与 CRITICAL 变体连字符；新增 Markdown/引号包裹负向测试 |
 
 ## Final Verification
 
+### 里程碑 17（本轮）
+
 | Command | Exit | Result |
 | --- | ---: | --- |
-| 带 Summary 的真实步骤耗尽 fixture、Runner 暂停路径及原误报反例定向回归 | 0 | 10 tests passed |
-| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest tests.test_opencode_adapter tests.test_remote_reviewer tests.test_runner -v` | 0 | 60 tests passed |
-| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v` | 0 | 104 tests passed |
-| `PYTHONDONTWRITEBYTECODE=1 /tmp/agentflow-step-limit-summary-venv.4vvrVz/bin/python -m unittest discover -s tests -q`（隔离环境，无 `PYTHONPATH`） | 0 | 104 tests passed |
-| `python3 -m compileall -q src tests` | 0 | passed |
-| canonical `quick_validate.py skills/multi-model-agentflow` | 0 | `Skill is valid!` |
-| installed `quick_validate.py /Users/fredafrica/.codex/skills/multi-model-agentflow` | 0 | `Skill is valid!` |
-| `uv build --wheel --offline --no-python-downloads --no-build-isolation ...` | 0 | `/tmp/agentflow-step-limit-summary-build.1lhyyf/multi_model_agentflow-0.1.0-py3-none-any.whl` |
-| final wheel `pip install --no-index --no-deps`, import and `agentflow --help` | 0 | installed, imported and CLI started in `/tmp/agentflow-step-limit-summary-venv.4vvrVz` |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_opencode_adapter.py' -v` | 0 | 39 tests passed |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_runner.py' -v` | 0 | 42 tests passed |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v` | 0 | 173 tests passed |
+| `PYTHONPYCACHEPREFIX=/private/tmp/agentflow-pyc python3 -m compileall -q src tests` | 0 | passed |
 | `git diff --check` | 0 | passed |
 
-Final wheel SHA-256: `ee63e4a6c40a1e65a1c9a64f3c5f128677652a491414664d425836e2c73b7458`.
+### 里程碑 16（本轮）
 
-Canonical and installed `SKILL.md` SHA-256: `5366b16b9db0c24cdffeaedddee5ded029656f6c4883d214a1e307eb12041851`（逐字节一致）。
+| Command | Exit | Result |
+| --- | ---: | --- |
+| P1 定向回归（pause TOCTOU、base/continuation PLANNED、非法元数据、fallback 精确模型/session、session mismatch、STARTED/COMPLETED 崩溃恢复） | 0 | 8 项通过 |
+| `test_opencode_adapter` | 0 | 34 tests passed |
+| `test_runner` | 0 | 41 tests passed |
+| `test_core` | 0 | 46 tests passed |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v` | 0 | 167 tests passed |
+| `PYTHONPYCACHEPREFIX=/private/tmp/agentflow-pyc python3 -m compileall -q src tests` | 0 | passed |
+| `git diff --check` | 0 | passed |
+
+### 里程碑 15（历史）
+
+| Command | Exit | Result |
+| --- | ---: | --- |
+| 超时定向回归（bytes 输出、多步累计、重叠去重、相同独立 step 计数、UTF-8 截断合并、completed_step_count） | 0 | 新增 4 项，更新 2 项 |
+| `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src python3 -m unittest discover -s tests -v` | 0 | 136 tests passed |
+| `python3 -m compileall -q src tests` | 0 | passed |
+| `git diff --check` | 0 | passed |
+
+Final wheel SHA-256: `41a28e72f8f51bddb04d997cb3c5953705ebe816083198050d0e255e658167c3`.
+
+Canonical and installed `SKILL.md` SHA-256: `b0ac3274673d7439accdaaae4088e4eec526716d13128ea7564451430788d855`（逐字节一致）。
 
 Canonical and installed `agents/openai.yaml` SHA-256: `3d6e327648b9db455d0f96a278c6c7be957a65f7e66c65f9d2863239dc90c0ed`（逐字节一致）。
 

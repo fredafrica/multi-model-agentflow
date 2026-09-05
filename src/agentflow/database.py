@@ -80,12 +80,24 @@ class Database:
                 "INTEGER NOT NULL DEFAULT 0 CHECK (cost_unavailable IN (0, 1))"
             ),
             "test_double": "INTEGER NOT NULL DEFAULT 0 CHECK (test_double IN (0, 1))",
+            "segment_index": "INTEGER NOT NULL DEFAULT 0 CHECK (segment_index >= 0)",
+            "continuation_of_call_id": "TEXT",
+            "continuation_session_id": "TEXT",
         }
         for name, definition in additions.items():
             if name not in columns:
                 self.connection.execute(
                     f"ALTER TABLE model_calls ADD COLUMN {name} {definition}"
                 )
+        # Rebuild the provider-request index to include segment_index so that
+        # continuation segments reusing the same OpenCode session ID do not
+        # collide with their parent call.
+        self.connection.execute("DROP INDEX IF EXISTS idx_model_calls_provider_request")
+        self.connection.execute(
+            "CREATE UNIQUE INDEX idx_model_calls_provider_request "
+            "ON model_calls(provider, provider_request_id, segment_index) "
+            "WHERE provider_request_id IS NOT NULL"
+        )
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_now()),
@@ -540,7 +552,85 @@ class Database:
                 {"approved": approved},
             )
 
-    def register_call(self, request: InvocationRequest, attempt_id: str) -> tuple[sqlite3.Row, bool]:
+    def _insert_planned_call(
+        self,
+        connection: sqlite3.Connection,
+        request: InvocationRequest,
+        attempt_id: str,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO model_calls(
+                call_id, request_key, attempt_id, provider, model_id, model_version,
+                model_family, is_local, role, state, data_sensitivity, read_only,
+                request_scope_json, remote_cost, cost_unavailable, test_double,
+                segment_index, continuation_of_call_id, continuation_session_id,
+                input_tokens, output_tokens, duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, ?, ?, ?, 0, 0, 0)
+            """,
+            (
+                request.call_id,
+                request.request_key,
+                attempt_id,
+                request.model.provider,
+                request.model.model_id,
+                request.model.version,
+                request.model.family,
+                int(request.model.is_local),
+                request.role,
+                InvocationState.PLANNED.value,
+                request.data_sensitivity.value,
+                int(request.read_only),
+                canonical_json(
+                    {
+                        "allowed_files": request.metadata.get("allowed_files", ()),
+                        "test_double": bool(request.metadata.get("test_double", False)),
+                        "packet_hash": request.metadata.get("packet_hash"),
+                        "packet_size": request.metadata.get("packet_size"),
+                        "privacy_policy_version": request.metadata.get(
+                            "privacy_policy_version"
+                        ),
+                        "estimated_remote_cost": request.metadata.get(
+                            "estimated_remote_cost", 0
+                        ),
+                    }
+                ),
+                int(bool(request.metadata.get("test_double", False))),
+                int(request.metadata.get("segment_index", 0)),
+                request.metadata.get("continuation_of_call_id"),
+                request.metadata.get("continuation_session_id"),
+            ),
+        )
+        self._event(
+            connection,
+            "call",
+            request.call_id,
+            "call.planned",
+            {"request_key": request.request_key},
+        )
+        continuation_of_call_id = request.metadata.get("continuation_of_call_id")
+        if continuation_of_call_id is not None:
+            self._event(
+                connection,
+                "run",
+                request.run_id,
+                "continuation.scheduled",
+                {
+                    "task_id": request.task_id,
+                    "attempt_id": attempt_id,
+                    "continuation_of_call_id": continuation_of_call_id,
+                    "segment_index": int(request.metadata.get("segment_index", 0)),
+                    "session_id": request.metadata.get("continuation_session_id"),
+                },
+            )
+
+    def register_call(
+        self,
+        request: InvocationRequest,
+        attempt_id: str,
+        *,
+        reuse_planned: bool = False,
+    ) -> tuple[sqlite3.Row, bool]:
         with self.transaction() as connection:
             existing = connection.execute(
                 "SELECT * FROM model_calls WHERE request_key = ?", (request.request_key,)
@@ -551,57 +641,82 @@ class Database:
                     return existing, False
                 if state is InvocationState.UNKNOWN:
                     raise UnknownInvocationError("call outcome is unknown; reconcile before retrying")
+                if state is InvocationState.PLANNED and reuse_planned:
+                    return existing, False
                 raise DuplicateInvocationError(f"call already exists in state {state.value}")
-            connection.execute(
-                """
-                INSERT INTO model_calls(
-                    call_id, request_key, attempt_id, provider, model_id, model_version,
-                    model_family, is_local, role, state, data_sensitivity, read_only,
-                    request_scope_json, remote_cost, cost_unavailable, test_double,
-                    input_tokens, output_tokens, duration_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, 0, 0)
-                """,
-                (
-                    request.call_id,
-                    request.request_key,
-                    attempt_id,
-                    request.model.provider,
-                    request.model.model_id,
-                    request.model.version,
-                    request.model.family,
-                    int(request.model.is_local),
-                    request.role,
-                    InvocationState.PLANNED.value,
-                    request.data_sensitivity.value,
-                    int(request.read_only),
-                    canonical_json(
-                        {
-                            "allowed_files": request.metadata.get("allowed_files", ()),
-                            "test_double": bool(request.metadata.get("test_double", False)),
-                            "packet_hash": request.metadata.get("packet_hash"),
-                            "packet_size": request.metadata.get("packet_size"),
-                            "privacy_policy_version": request.metadata.get(
-                                "privacy_policy_version"
-                            ),
-                            "estimated_remote_cost": request.metadata.get(
-                                "estimated_remote_cost", 0
-                            ),
-                        }
-                    ),
-                    int(bool(request.metadata.get("test_double", False))),
-                ),
-            )
-            self._event(
-                connection,
-                "call",
-                request.call_id,
-                "call.planned",
-                {"request_key": request.request_key},
-            )
+            self._insert_planned_call(connection, request, attempt_id)
             created = connection.execute(
                 "SELECT * FROM model_calls WHERE call_id = ?", (request.call_id,)
             ).fetchone()
             return created, True
+
+    def begin_call(
+        self,
+        request: InvocationRequest,
+        attempt_id: str,
+        *,
+        reuse_planned: bool = False,
+    ) -> tuple[sqlite3.Row | None, str]:
+        """Atomically gate, register, and start a model call in one transaction.
+
+        The single ``BEGIN IMMEDIATE`` transaction re-checks that the run is
+        still RUNNING, registers the call (or idempotently reuses an existing
+        PLANNED call), transitions the allowed call to STARTED, and audits the
+        transition. This closes the pause TOCTOU between the runner's gate check
+        and the adapter invocation.
+
+        Returns ``(row, outcome)`` where ``outcome`` is one of:
+          - ``STARTED``: the call is registered (or a PLANNED call reused) and
+            is now STARTED; ``row`` is the authoritative persisted row.
+          - ``REUSED_COMPLETED``: an existing COMPLETED call was returned.
+          - ``PAUSE_BLOCKED``: the run was no longer RUNNING; nothing changed.
+        Raises ``UnknownInvocationError`` / ``DuplicateInvocationError`` as before.
+        """
+        with self.transaction() as connection:
+            control = connection.execute(
+                "SELECT control_state FROM runs WHERE run_id = ?", (request.run_id,)
+            ).fetchone()
+            if control is None:
+                raise KeyError(f"unknown run: {request.run_id}")
+            if ControlState(control["control_state"]) is not ControlState.RUNNING:
+                return None, "PAUSE_BLOCKED"
+            existing = connection.execute(
+                "SELECT * FROM model_calls WHERE request_key = ?", (request.request_key,)
+            ).fetchone()
+            if existing is not None:
+                state = InvocationState(existing["state"])
+                if state is InvocationState.COMPLETED:
+                    return existing, "REUSED_COMPLETED"
+                if state is InvocationState.UNKNOWN:
+                    raise UnknownInvocationError(
+                        "call outcome is unknown; reconcile before retrying"
+                    )
+                if not (state is InvocationState.PLANNED and reuse_planned):
+                    raise DuplicateInvocationError(
+                        f"call already exists in state {state.value}"
+                    )
+                call_id = str(existing["call_id"])
+            else:
+                self._insert_planned_call(connection, request, attempt_id)
+                call_id = request.call_id
+            connection.execute(
+                "UPDATE model_calls SET state = ?, started_at = ? WHERE call_id = ?",
+                (InvocationState.STARTED.value, utc_now(), call_id),
+            )
+            self._event(
+                connection,
+                "call",
+                call_id,
+                "call.transitioned",
+                {
+                    "from": InvocationState.PLANNED.value,
+                    "to": InvocationState.STARTED.value,
+                },
+            )
+            row = connection.execute(
+                "SELECT * FROM model_calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            return row, "STARTED"
 
     def transition_call(self, call_id: str, target: InvocationState) -> None:
         with self.transaction() as connection:
@@ -652,6 +767,56 @@ class Database:
                 call_id,
                 "call.provider_request_recorded",
                 {"provider_request_id": provider_request_id},
+            )
+
+    def mark_call_unknown(
+        self,
+        call_id: str,
+        provider_request_id: str | None,
+        result: InvocationResult,
+    ) -> None:
+        """Persist an unknown outcome while keeping confirmed usage evidence."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM model_calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown call: {call_id}")
+            current = InvocationState(row["state"])
+            require_transition(current, InvocationState.UNKNOWN)
+            connection.execute(
+                """
+                UPDATE model_calls SET
+                    state = ?, provider_request_id = COALESCE(?, provider_request_id),
+                    input_tokens = ?, output_tokens = ?,
+                    first_token_latency_ms = ?, duration_ms = ?, remote_cost = ?,
+                    cost_unavailable = ?, output_text = ?, raw_metadata_json = ?, finished_at = ?
+                WHERE call_id = ?
+                """,
+                (
+                    InvocationState.UNKNOWN.value,
+                    provider_request_id,
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.first_token_latency_ms,
+                    result.duration_ms,
+                    result.remote_cost,
+                    int(result.cost_unavailable),
+                    result.output,
+                    canonical_json(result.raw_metadata),
+                    utc_now(),
+                    call_id,
+                ),
+            )
+            self._event(
+                connection,
+                "call",
+                call_id,
+                "call.unknown",
+                {
+                    "remote_cost": result.remote_cost,
+                    "cost_unavailable": result.cost_unavailable,
+                },
             )
 
     def complete_call(self, call_id: str, result: InvocationResult, run_id: str) -> None:
@@ -846,22 +1011,67 @@ class Database:
         )
         return int(row["count"])
 
-    def known_incomplete_calls(self, run_id: str) -> int:
+    def step_limit_calls_without_continuation(self, run_id: str) -> list[dict[str, Any]]:
         rows = self.connection.execute(
             """
-            SELECT model_calls.raw_metadata_json FROM model_calls
+            SELECT model_calls.call_id, model_calls.attempt_id, attempts.task_id,
+                   model_calls.role, model_calls.is_local, model_calls.segment_index,
+                   model_calls.provider_request_id, model_calls.raw_metadata_json
+            FROM model_calls
             JOIN attempts USING (attempt_id)
             WHERE attempts.run_id = ? AND model_calls.state = ?
+              AND NOT EXISTS (
+                  SELECT 1 FROM model_calls AS child
+                  WHERE child.continuation_of_call_id = model_calls.call_id
+                    AND child.state != ?
+              )
             """,
-            (run_id, InvocationState.FAILED.value),
+            (
+                run_id,
+                InvocationState.FAILED.value,
+                InvocationState.PLANNED.value,
+            ),
         ).fetchall()
-        return sum(
-            1
-            for row in rows
-            if row["raw_metadata_json"]
-            and json.loads(row["raw_metadata_json"]).get("failure_kind")
-            == "step_limit_reached"
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            if not row["raw_metadata_json"]:
+                continue
+            metadata = json.loads(row["raw_metadata_json"])
+            if metadata.get("failure_kind") != "step_limit_reached":
+                continue
+            result.append(dict(row))
+        return result
+
+    def latest_role_call(self, attempt_id: str, role: str) -> sqlite3.Row | None:
+        return self.fetch_one(
+            """
+            SELECT call_id, request_key, state, segment_index, provider_request_id,
+                   raw_metadata_json, role, is_local,
+                   provider, model_id, model_version, model_family,
+                   continuation_of_call_id, continuation_session_id
+            FROM model_calls
+            WHERE attempt_id = ? AND role = ?
+            ORDER BY segment_index DESC, rowid DESC
+            LIMIT 1
+            """,
+            (attempt_id, role),
         )
+
+    def unfinished_calls(self, run_id: str) -> int:
+        row = self.fetch_one(
+            """
+            SELECT COUNT(*) AS count FROM model_calls
+            JOIN attempts USING (attempt_id)
+            WHERE attempts.run_id = ? AND model_calls.state IN (?, ?, ?)
+            """,
+            (
+                run_id,
+                InvocationState.PLANNED.value,
+                InvocationState.STARTED.value,
+                InvocationState.UNKNOWN.value,
+            ),
+        )
+        return int(row["count"])
 
     def inflight_calls(self, run_id: str) -> int:
         row = self.fetch_one(

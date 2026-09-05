@@ -14,6 +14,9 @@ from .contracts import (
     BudgetMode,
     BusinessImportance,
     DataSensitivity,
+    DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS,
+    DEFAULT_IMPLEMENTATION_MAX_STEPS,
+    DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
     ModelSelectionStrategy,
     ModelRef,
     OperationalSafety,
@@ -84,6 +87,15 @@ def task_from_mapping(data: Mapping[str, Any]) -> TaskContract:
         expected_outputs=tuple(str(item) for item in data["expected_outputs"]),
         depends_on=tuple(str(item) for item in data.get("depends_on", ())),
         test_command=tuple(str(item) for item in data.get("test_command", ())),
+        implementation_max_steps=data.get(
+            "implementation_max_steps", DEFAULT_IMPLEMENTATION_MAX_STEPS
+        ),
+        implementation_timeout_seconds=data.get(
+            "implementation_timeout_seconds", DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
+        ),
+        implementation_max_continuations=data.get(
+            "implementation_max_continuations", DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS
+        ),
     )
 
 

@@ -1,5 +1,13 @@
 # 实施进度
 
+## 2026-09-05
+
+- 修复真实步骤耗尽检测遗漏：真实 Qwen implementation/revision 输出把终止标记作为“前缀推理文本 + `</think>` + 独立终止行 + 长 Markdown Summary”中的独立行，旧 `_text_reports_step_limit` 只检查首行或整段 `fullmatch`，导致两个调用被误记 `completed` 并错误进入 revision。
+- 将 `_text_reports_step_limit` 改为逐行结构化扫描：跟踪 fenced code、跳过 blockquote/diff/缩进，仅匹配规范化后整行等于已接受终止标记的行；检测到后抛 `InvocationIncompleteError`（`step_limit_reached`、`termination_source=final_text`）并保留 session ID、Token、费用、耗时与输出证据；退出码 0 与非 0 均正确分类。
+- Runner 经既有同会话 continuation 续接而非运行 deterministic tests 或开启新 revision；新增真实 OpenCodeAdapter 替身回归证明 base 记步骤耗尽、产生 `continuation.scheduled`、同 session 递增 segment_index，第二段完成后才进入确定性测试；review/rereview 仍不续接。
+- 新增最小脱敏 fixture `opencode_max_steps_long.jsonl` 与 5 项回归测试；全套 172 项测试、compileall、`git diff --check` 均通过。
+- 修复二轮 P1：`_line_is_step_limit_marker` 不再先剥离标点，改为对原始行严格锚定 `re.fullmatch`，避免把标题/加粗/斜体/行内代码/引号/列表包裹的终止短语误判为真实终止；新增负向测试，全套 173 项通过。
+
 ## 2026-09-04
 
 - 启动真实 OpenCode 故障修复；明确本轮不启动子 Agent、不调用真实远程模型、不产生 API 费用、不创建 commit。

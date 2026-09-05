@@ -16,8 +16,9 @@ Before the first model call:
 1. Read the target project's `AGENTS.md` and `.agentflow/project.toml` when present.
 2. Classify business importance (B0-B3), operational safety (S0-S3), and data sensitivity (D0-D3) separately.
 3. Put finite tasks, exact allowed files, forbidden actions, acceptance criteria, role models, budget, retries, and escalation conditions in `.agentflow/plan.json`.
-4. Run `agentflow --project <root> plan show` and present the exact SHA-256 plus the effective scope, models, file boundaries, remote budget, privacy policy, mode, and expiry.
-5. Wait for explicit approval of that plan hash. Only then run `agentflow --project <root> plan authorize --hash <sha256>` and `agentflow --project <root> start <plan-id>`.
+4. Set an explicit finite `implementation_max_steps` (1-32) for local tasks that must read multiple evidence files, e.g. 12-16. The default 8 only exists for backward compatibility. Set an explicit `implementation_timeout_seconds` (60-14400) for long-running local tasks; the default 900 only exists for backward compatibility. Set `implementation_max_continuations` (0-8) only when the local implementation may outgrow a single step budget and is authorized to continue in the same OpenCode session; the default 0 disables continuation.
+5. Run `agentflow --project <root> plan show` and present the exact SHA-256 plus the effective scope, models, file boundaries, remote budget, privacy policy, mode, and expiry.
+6. Wait for explicit approval of that plan hash. Only then run `agentflow --project <root> plan authorize --hash <sha256>` and `agentflow --project <root> start <plan-id>`.
 
 Any plan, model, file, budget, remote-data, permission, or side-effect expansion invalidates the prior approval. Show the changed scope and obtain a new authorization snapshot.
 
@@ -30,7 +31,7 @@ Any plan, model, file, budget, remote-data, permission, or side-effect expansion
 - AgentFlow may use OpenCode for a plan-selected remote reviewer, but only for `review`/`rereview`. The reviewer must be independently selected, read-only, budget-limited, and unable to edit, use shells, browse the web, invoke skills, or start subagents.
 - Apply D0-D3 to the minimal Review Packet. D1 requires plan-specific remote approval; D2 requires both plan-specific approval and a real passed redaction check; D3 never goes remote.
 - OpenCode configured/discoverable status is not proof that a model is callable. A real smoke test requires its own plan, displayed hash, explicit approval, and authorization.
-- Treat a recorded step-limit or incomplete invocation as a known failed call, not completion or `UNKNOWN`. Stop at its saved boundary and do not resume or retry it speculatively; preserve recorded usage and cost evidence.
+- Treat a recorded step-limit or incomplete invocation as a known failed call, not completion or `UNKNOWN`. Stop at its saved boundary and do not resume or retry it speculatively; preserve recorded usage and cost evidence. A local implementation/revision call that hit the step limit may only continue in the same OpenCode session as a new segment while within `implementation_max_continuations`, same model/worktree/file scope, and a valid session id; remote read-only reviewers never continue.
 - Important or critical tasks require a review model from a different family. If none is available, stop at `waiting_review`; never represent the task as approved.
 
 ## Operating modes

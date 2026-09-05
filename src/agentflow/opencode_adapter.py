@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -23,6 +24,11 @@ from .adapters import (
 )
 from .contracts import (
     BusinessImportance,
+    DEFAULT_IMPLEMENTATION_MAX_STEPS,
+    DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+    IMPLEMENTATION_MAX_STEPS_LIMIT,
+    IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT,
+    IMPLEMENTATION_TIMEOUT_SECONDS_MIN,
     InvocationRequest,
     InvocationResult,
     ModelAvailabilityState,
@@ -102,12 +108,15 @@ class OpenCodeAdapter:
         worktree = Path(str(request.metadata["worktree"])).resolve()
         if not worktree.is_dir():
             raise ValueError("invocation worktree does not exist")
+        steps = _implementation_steps(request.metadata)
+        timeout_seconds = _implementation_timeout(request.metadata)
         prompt = self._bounded_prompt(request)
         environment = os.environ.copy()
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-            self._permission_config(read_only=request.read_only), separators=(",", ":")
+            self._permission_config(read_only=request.read_only, steps=steps),
+            separators=(",", ":"),
         )
-        command = (
+        command = [
             self.opencode_command,
             "run",
             "--format",
@@ -118,10 +127,11 @@ class OpenCodeAdapter:
             "agentflow-sandbox",
             "--model",
             f"lmstudio/{request.model.model_id}",
-            "--dir",
-            str(worktree),
-            prompt,
-        )
+        ]
+        session_id = _continuation_session(request.metadata)
+        if session_id is not None:
+            command.extend(("--session", session_id))
+        command.extend(("--dir", str(worktree), prompt))
         started = time.monotonic()
         process = subprocess.Popen(
             command,
@@ -136,18 +146,42 @@ class OpenCodeAdapter:
         if callable(callback):
             callback(process_reference)
         try:
-            stdout, stderr = process.communicate(timeout=self.timeout_seconds)
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as error:
             self.cancel(process_reference)
-            process.communicate()
+            partial_stdout = _collect_timeout_output(error, process)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = parse_opencode_partial_usage(
+                partial_stdout,
+                duration_ms=duration_ms,
+                timeout_seconds=timeout_seconds,
+            )
             raise InvocationOutcomeUnknown(
                 "OpenCode timed out; inspect the local worktree before retrying",
                 process_reference,
+                result=result,
             ) from error
         duration_ms = int((time.monotonic() - started) * 1000)
+        if process.returncode is not None and process.returncode < 0:
+            raise InvocationOutcomeUnknown(
+                "OpenCode was terminated by a signal; inspect the local worktree "
+                "before retrying",
+                process_reference,
+            )
         if process.returncode:
+            try:
+                parse_opencode_json(stdout, duration_ms=duration_ms, is_local=True)
+            except InvocationIncompleteError as error:
+                if session_id is not None:
+                    _verify_session_reuse(session_id, error.result)
+                raise
+            except RuntimeError:
+                pass
             raise RuntimeError(stderr.strip() or "OpenCode invocation failed")
-        return parse_opencode_json(stdout, duration_ms=duration_ms, is_local=True)
+        result = parse_opencode_json(stdout, duration_ms=duration_ms, is_local=True)
+        if session_id is not None:
+            _verify_session_reuse(session_id, result)
+        return result
 
     def query(self, provider_request_id: str) -> InvocationResult | None:
         return None
@@ -167,7 +201,7 @@ class OpenCodeAdapter:
         return True
 
     @staticmethod
-    def _permission_config(*, read_only: bool) -> dict[str, Any]:
+    def _permission_config(*, read_only: bool, steps: int = DEFAULT_IMPLEMENTATION_MAX_STEPS) -> dict[str, Any]:
         permission = {
             "*": "deny",
             "read": {
@@ -199,7 +233,7 @@ class OpenCodeAdapter:
                 "agentflow-sandbox": {
                     "description": "Bounded local AgentFlow task",
                     "mode": "primary",
-                    "steps": 8,
+                    "steps": steps,
                     "permission": permission,
                 }
             },
@@ -372,6 +406,12 @@ class RemoteOpenCodeReviewerAdapter:
                     process_reference,
                 )
             if process.returncode:
+                try:
+                    parse_opencode_json(stdout, duration_ms=duration_ms, is_local=False)
+                except InvocationIncompleteError:
+                    raise
+                except RuntimeError:
+                    pass
                 raise ModelUnavailableError(
                     "model unavailable: "
                     + (stderr.strip() or f"{self.provider}/{request.model.model_id}")
@@ -426,12 +466,185 @@ class RemoteOpenCodeReviewerAdapter:
         }
 
 
+def _implementation_steps(metadata: Mapping[str, Any]) -> int:
+    value = metadata.get("implementation_max_steps", DEFAULT_IMPLEMENTATION_MAX_STEPS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("implementation_max_steps must be a positive integer")
+    if not 1 <= value <= IMPLEMENTATION_MAX_STEPS_LIMIT:
+        raise ValueError(
+            "implementation_max_steps must be between 1 and "
+            f"{IMPLEMENTATION_MAX_STEPS_LIMIT}"
+        )
+    return value
+
+
+def _implementation_timeout(metadata: Mapping[str, Any]) -> int:
+    value = metadata.get(
+        "implementation_timeout_seconds", DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
+    )
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, int):
+        raise ValueError("implementation_timeout_seconds must be an integer")
+    if not IMPLEMENTATION_TIMEOUT_SECONDS_MIN <= value <= IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT:
+        raise ValueError(
+            "implementation_timeout_seconds must be between "
+            f"{IMPLEMENTATION_TIMEOUT_SECONDS_MIN} and "
+            f"{IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT}"
+        )
+    return value
+
+
+def _continuation_session(metadata: Mapping[str, Any]) -> str | None:
+    """Read and validate the reused OpenCode session ID for a continuation segment."""
+    value = metadata.get("continuation_session_id")
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("continuation_session_id must be a non-empty string")
+    session_id = value.strip()
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in session_id):
+        raise ValueError("continuation_session_id contains invalid characters")
+    return session_id
+
+
+def _verify_session_reuse(continuation_session_id: str, result: InvocationResult) -> None:
+    """Reject a continuation whose returned session differs from the requested one.
+
+    OpenCode is expected to report the same session ID it was asked to resume. A
+    different (or missing) session means the continuation did not actually reuse
+    the parent context, which is a protocol error that must not be silently
+    continued, tested, or reviewed.
+    """
+    if result.provider_request_id == continuation_session_id:
+        return
+    raise InvocationIncompleteError(
+        "OpenCode did not reuse the requested continuation session; the returned "
+        "session ID differs from the requested session",
+        result,
+        failure_kind="session_mismatch",
+    )
+
+
+def _as_output_bytes(value: Any) -> bytes:
+    if value is None:
+        return b""
+    if isinstance(value, bytes):
+        return value
+    return str(value).encode("utf-8")
+
+
+def _merge_overlapping_output_bytes(first: bytes, second: bytes) -> bytes:
+    """Join two byte reads of the same stream, removing the overlapping prefix.
+
+    This runs on raw bytes so a UTF-8 multi-byte character split across the two
+    reads still merges correctly, and identical-but-independent events are never
+    treated as duplicates.
+    """
+    if not first:
+        return second
+    if not second:
+        return first
+    if second.startswith(first):
+        return second
+    if first.startswith(second):
+        return first
+    max_overlap = min(len(first), len(second))
+    for size in range(max_overlap, 0, -1):
+        if first.endswith(second[:size]):
+            return first + second[size:]
+    return first + second
+
+
+def _collect_timeout_output(
+    error: subprocess.TimeoutExpired, process: subprocess.Popen
+) -> bytes:
+    first = _as_output_bytes(error.output)
+    try:
+        second_stdout, _ = process.communicate()
+    except Exception:
+        second_stdout = b""
+    return _merge_overlapping_output_bytes(first, _as_output_bytes(second_stdout))
+
+
+def parse_opencode_partial_usage(
+    data: bytes, *, duration_ms: int, timeout_seconds: int
+) -> InvocationResult:
+    """Extract conservative usage evidence from partial OpenCode JSON events.
+
+    The output text is intentionally empty: a timed-out call has no confirmed
+    result. Each completed step reports its own token usage, so every real
+    token-bearing event in the merged stream is summed. Overlap between the two
+    reads is removed at the raw byte-stream level before decoding; events are
+    never de-duplicated by their content.
+    """
+    text = data.decode("utf-8", errors="replace")
+    input_tokens = 0
+    output_tokens = 0
+    reasoning_tokens = 0
+    saw_reasoning = False
+    provider_request_id: str | None = None
+    event_count = 0
+    completed_step_count = 0
+    saw_usage = False
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        try:
+            event = json.loads(raw_line)
+        except json.JSONDecodeError:
+            continue
+        event_count += 1
+        provider_request_id = provider_request_id or _find_string(
+            event, ("sessionID", "sessionId", "session_id")
+        )
+        if str(event.get("type", "")) == "step_finish":
+            completed_step_count += 1
+        part = event.get("part") if isinstance(event.get("part"), Mapping) else event
+        tokens = part.get("tokens") if isinstance(part.get("tokens"), Mapping) else {}
+        in_tokens = _token_total(tokens.get("input"))
+        out_tokens = _token_total(tokens.get("output"))
+        if in_tokens or out_tokens:
+            saw_usage = True
+        input_tokens += in_tokens
+        output_tokens += out_tokens
+        reasoning = _token_total(tokens.get("reasoning"))
+        if reasoning:
+            saw_reasoning = True
+            reasoning_tokens += reasoning
+
+    metadata = {
+        "termination_reason": "timeout",
+        "timeout_seconds": timeout_seconds,
+        "token_source": "opencode_json_events" if saw_usage else "unavailable",
+        "usage_unavailable": not saw_usage,
+        "event_count": event_count,
+        "completed_step_count": completed_step_count,
+        "session_id": provider_request_id,
+        "reasoning_tokens": reasoning_tokens if saw_reasoning else None,
+        "partial_stdout_bytes": len(data),
+        "partial_stdout_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    return InvocationResult(
+        provider_request_id=provider_request_id,
+        output="",
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        first_token_latency_ms=None,
+        duration_ms=duration_ms,
+        remote_cost=0.0,
+        raw_metadata=metadata,
+        cost_unavailable=False,
+    )
+
+
 def parse_opencode_json(
     text: str, *, duration_ms: int, is_local: bool = False
 ) -> InvocationResult:
     output_parts: list[str] = []
     input_tokens = 0
     output_tokens = 0
+    reasoning_tokens = 0
+    saw_reasoning = False
     provider_request_id: str | None = None
     first_token_latency_ms: int | None = None
     reported_cost = 0.0
@@ -461,8 +674,12 @@ def parse_opencode_json(
                     part, ("firstTokenLatencyMs", "latency")
                 )
         tokens = part.get("tokens") if isinstance(part.get("tokens"), Mapping) else {}
-        input_tokens = max(input_tokens, _token_total(tokens.get("input")))
-        output_tokens = max(output_tokens, _token_total(tokens.get("output")))
+        input_tokens += _token_total(tokens.get("input"))
+        output_tokens += _token_total(tokens.get("output"))
+        reasoning = _token_total(tokens.get("reasoning"))
+        if reasoning:
+            saw_reasoning = True
+            reasoning_tokens += reasoning
         cost = part.get("cost", event.get("cost"))
         if isinstance(cost, (int, float)):
             reported_cost += float(cost)
@@ -483,6 +700,7 @@ def parse_opencode_json(
         "event_types": event_types,
         "reported_cost": reported_cost if cost_reported else None,
         "cost_unavailable": not is_local and not cost_reported,
+        "reasoning_tokens": reasoning_tokens if saw_reasoning else None,
     }
     if termination_source is not None:
         metadata.update(
@@ -557,42 +775,59 @@ def _structured_value_reports_step_limit(text: str) -> bool:
     return _text_reports_step_limit(text)
 
 
+_STEP_LIMIT_LINE_RE = re.compile(
+    r"(?:"
+    r"(?:the )?max(?:imum)?(?: number of)? steps(?: for this agent)? "
+    r"(?:have been|has been|were|was) reached"
+    r"|critical\s*[-–—]\s*max(?:imum)? steps reached"
+    r")\.?",
+    re.IGNORECASE,
+)
+
+
+def _line_is_step_limit_marker(line: str) -> bool:
+    """Match only a bare, unquoted step-limit termination line.
+
+    The raw line is matched with strict anchoring, never after stripping
+    punctuation, so Markdown headings, emphasis, inline code, list bullets and
+    quotation marks all fail the match instead of being collapsed into a legal
+    marker. Only a single trailing period is tolerated.
+    """
+    stripped = line.strip()
+    if not stripped:
+        return False
+    return _STEP_LIMIT_LINE_RE.fullmatch(stripped) is not None
+
+
 def _text_reports_step_limit(text: str) -> bool:
-    lines = tuple(line for line in text.splitlines() if line.strip())
-    if not lines:
-        return False
-    first = lines[0]
-    if first != first.strip() or first.startswith(("```", ">", "+", "-", "@@")):
-        return False
-    stripped = text.strip()
-    normalized = re.sub(r"[^a-z0-9]+", " ", stripped.lower()).strip()
-    if re.fullmatch(
-        r"(?:critical )?(?:max(?:imum)? steps reached|"
-        r"(?:the )?maximum number of steps(?: for this agent)? "
-        r"(?:has been |have been |was |were )?reached)"
-        r"(?: (?:the )?maximum number of steps(?: for this agent)? "
-        r"(?:has been |have been |was |were )?reached)?"
-        r"(?: tools are disabled until the next user input)?",
-        normalized,
-    ) is not None:
-        return True
-    if re.fullmatch(
-        r"critical\s*[-–—]\s*max(?:imum)? steps reached",
-        first,
-        flags=re.IGNORECASE,
-    ) is None or len(lines) < 2:
-        return False
-    explanation = lines[1]
-    if explanation != explanation.strip() or explanation.startswith(
-        ("```", ">", "+", "-", "@@")
-    ):
-        return False
-    normalized_explanation = re.sub(
-        r"[^a-z0-9]+", " ", explanation.lower()
-    ).strip()
-    return normalized_explanation.startswith(
-        "the maximum number of steps for this agent has been reached"
-    )
+    """Detect an independent, unquoted step-limit termination line.
+
+    OpenCode appends its termination notice to an otherwise ordinary model turn,
+    so the marker is often neither the first line nor the only line: it follows
+    reasoning text and ``</think>`` and is trailed by a long Markdown summary.
+    Scan line by line, skipping fenced code blocks, blockquotes, diff hunks and
+    indented content, and match only bare, unquoted lines whose raw text equals
+    an accepted termination marker. This avoids treating quoted prose, review
+    JSON fields or summary text that merely mentions the phrase as a
+    termination.
+    """
+    in_fence = False
+    for raw_line in text.splitlines():
+        if not raw_line.strip():
+            continue
+        stripped = raw_line.strip()
+        if raw_line == raw_line.lstrip() and stripped.startswith(("```", "~~~")):
+            in_fence = not in_fence
+            continue
+        if in_fence:
+            continue
+        if raw_line != raw_line.lstrip():
+            continue
+        if stripped.startswith((">", "+", "-", "@@")):
+            continue
+        if _line_is_step_limit_marker(stripped):
+            return True
+    return False
 
 
 def _token_total(value: Any) -> int:

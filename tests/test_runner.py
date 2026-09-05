@@ -13,6 +13,7 @@ from agentflow.adapters import (
     AdapterRouter,
     InvocationIncompleteError,
     InvocationOutcomeUnknown,
+    ModelUnavailableError,
 )
 from agentflow.contracts import (
     BudgetMode,
@@ -29,6 +30,7 @@ from agentflow.contracts import (
 )
 from agentflow.database import Database
 from agentflow.fake_adapter import FakeAdapter
+from agentflow.opencode_adapter import OpenCodeAdapter
 from agentflow.runner import Runner
 from agentflow.states import ControlState, InvocationState, RunState, TaskState
 from agentflow.workspace import GitWorkspace, GitWorkspaceError
@@ -101,6 +103,19 @@ def approved_response(request: InvocationRequest) -> InvocationResult:
         duration_ms=0,
         remote_cost=0,
         raw_metadata={"test_double": True},
+    )
+
+
+def step_limit_result() -> InvocationResult:
+    return InvocationResult(
+        "fake-session-1",
+        "CRITICAL - MAXIMUM STEPS REACHED",
+        11,
+        5,
+        2,
+        37,
+        0,
+        {"test_double": True},
     )
 
 
@@ -542,7 +557,7 @@ class RunnerTests(unittest.TestCase):
             ]
         )
         self.assertEqual("implementation_step_limit_reached", checkpoint["reason"])
-        with self.assertRaisesRegex(ValueError, "must not be retried"):
+        with self.assertRaisesRegex(ValueError, "cannot be continued"):
             runner.resume("implementation-step-limit-run", plan, authorization)
         self.assertEqual(1, len(adapter.invocations))
 
@@ -629,6 +644,1160 @@ class RunnerTests(unittest.TestCase):
         after = self.database.handoff_summary("handoff-run")
         self.assertEqual(before, after)
         self.assertTrue(Path(after["tasks"][0]["worktree_path"]).exists())
+
+    def test_nonzero_exit_step_limit_via_real_adapter_pauses_before_tests(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "opencode_max_steps.jsonl"
+        stdout = fixture.read_text(encoding="utf-8")
+
+        class NonZeroProcess:
+            pid = 41240
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return stdout, "non-zero exit"
+
+        process = NonZeroProcess()
+        captured: dict[str, object] = {}
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command and command[0] == "opencode-stub":
+                captured["env"] = kwargs["env"]
+                return process
+            return real_popen(command, **kwargs)
+
+        task = replace(
+            make_task("task-1"),
+            implementation_model=ModelRef(
+                "lmstudio", "qwen/qwen3.8-27b", "1", "qwen", True
+            ),
+        )
+        plan = make_plan(tasks=(task,))
+        adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+        router = AdapterRouter({"lmstudio": adapter, "fake": FakeAdapter()})
+        runner = Runner(self.database, router, self.workspace)
+        authorization = issue_authorization(plan)
+        with mock.patch("subprocess.Popen", side_effect=popen):
+            result = runner.start(
+                plan, authorization, run_id="real-adapter-step-limit-run"
+            )
+        self.assertEqual(RunState.PAUSED, result.state)
+        snapshot = self.database.run_snapshot("real-adapter-step-limit-run")
+        self.assertEqual(ControlState.PAUSED.value, snapshot["run"]["control_state"])
+        checkpoint = json.loads(snapshot["run"]["checkpoint_json"])
+        self.assertEqual("implementation_step_limit_reached", checkpoint["reason"])
+        self.assertEqual(
+            TaskState.RUNNING,
+            self.database.task_state("real-adapter-step-limit-run", task.task_id),
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM test_results"
+            )["count"],
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+        call = self.database.fetch_one(
+            "SELECT state, provider_request_id, input_tokens, output_tokens, "
+            "duration_ms, remote_cost, cost_unavailable, raw_metadata_json "
+            "FROM model_calls WHERE role = 'implementation'"
+        )
+        self.assertEqual(InvocationState.FAILED.value, call["state"])
+        self.assertEqual("session-step-limit", call["provider_request_id"])
+        self.assertEqual((17, 9), (call["input_tokens"], call["output_tokens"]))
+        self.assertGreaterEqual(call["duration_ms"], 0)
+        self.assertEqual(0.0, call["remote_cost"])
+        self.assertEqual(0, call["cost_unavailable"])
+        metadata = json.loads(call["raw_metadata_json"])
+        self.assertEqual("step_limit_reached", metadata["failure_kind"])
+        self.assertEqual("final_text", metadata["termination_source"])
+        config = json.loads(captured["env"]["OPENCODE_CONFIG_CONTENT"])
+        self.assertEqual(
+            task.implementation_max_steps, config["agent"]["agentflow-sandbox"]["steps"]
+        )
+        with self.assertRaisesRegex(ValueError, "cannot be continued"):
+            runner.resume("real-adapter-step-limit-run", plan, authorization)
+
+    def test_timeout_via_real_adapter_pauses_and_persists_unknown_usage(self) -> None:
+        partial = "\n".join(
+            (
+                json.dumps({"type": "step_start", "sessionID": "sess-9", "part": {}}),
+                json.dumps(
+                    {
+                        "type": "step_finish",
+                        "part": {"tokens": {"input": 17, "output": 9}},
+                    }
+                ),
+            )
+        )
+
+        class TimingOutProcess:
+            pid = 41241
+            returncode = -15
+            calls = 0
+
+            def communicate(self, timeout=None):
+                self.calls += 1
+                if self.calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ("opencode", "run"), timeout or 0, output=partial
+                    )
+                return "", ""
+
+        process = TimingOutProcess()
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command and command[0] == "opencode-stub":
+                return process
+            return real_popen(command, **kwargs)
+
+        task = replace(
+            make_task("task-1"),
+            implementation_model=ModelRef(
+                "lmstudio", "qwen/qwen3.8-27b", "1", "qwen", True
+            ),
+        )
+        plan = make_plan(tasks=(task,))
+        adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+        router = AdapterRouter({"lmstudio": adapter, "fake": FakeAdapter()})
+        runner = Runner(self.database, router, self.workspace)
+        authorization = issue_authorization(plan)
+        with mock.patch("subprocess.Popen", side_effect=popen):
+            result = runner.start(plan, authorization, run_id="timeout-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        snapshot = self.database.run_snapshot("timeout-run")
+        checkpoint = json.loads(snapshot["run"]["checkpoint_json"])
+        self.assertEqual("unknown_model_call", checkpoint["reason"])
+        call = self.database.fetch_one(
+            "SELECT state, provider_request_id, input_tokens, output_tokens, "
+            "duration_ms, remote_cost, cost_unavailable, raw_metadata_json, output_text "
+            "FROM model_calls WHERE role = 'implementation'"
+        )
+        self.assertEqual(InvocationState.UNKNOWN.value, call["state"])
+        self.assertEqual("local-process-group:41241", call["provider_request_id"])
+        self.assertEqual((17, 9), (call["input_tokens"], call["output_tokens"]))
+        self.assertEqual(0.0, call["remote_cost"])
+        self.assertEqual(0, call["cost_unavailable"])
+        self.assertEqual("", call["output_text"])
+        metadata = json.loads(call["raw_metadata_json"])
+        self.assertEqual("timeout", metadata["termination_reason"])
+        self.assertEqual("opencode_json_events", metadata["token_source"])
+        self.assertEqual("sess-9", metadata["session_id"])
+        self.assertEqual(1, self.database.unresolved_unknown_calls("timeout-run"))
+        with self.assertRaisesRegex(ValueError, "must be reconciled"):
+            runner.resume("timeout-run", plan, authorization)
+
+
+class ContinuationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        git(self.root, "init", "-b", "main")
+        git(self.root, "config", "user.email", "tests@example.invalid")
+        git(self.root, "config", "user.name", "AgentFlow Tests")
+        (self.root / "seed.txt").write_text("seed\n", encoding="utf-8")
+        git(self.root, "add", "seed.txt")
+        git(self.root, "commit", "-m", "seed")
+        runs = self.root / ".agentflow" / "runs"
+        self.database = Database(runs / "agentflow.db")
+        self.database.initialize()
+        self.workspace = GitWorkspace(self.root, runs)
+
+    def tearDown(self) -> None:
+        self.database.close()
+        self.temp.cleanup()
+
+    def _calls(self, role: str) -> list:
+        return list(
+            self.database.connection.execute(
+                "SELECT call_id, segment_index, continuation_of_call_id, "
+                "continuation_session_id, provider_request_id, state FROM model_calls "
+                "WHERE role = ? ORDER BY segment_index",
+                (role,),
+            ).fetchall()
+        )
+
+    def test_step_limit_continues_in_same_session(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) < 2
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="continuation-run")
+        self.assertEqual(RunState.COMPLETED, result.state)
+
+        implementation = [r for r in adapter.invocations if r.role == "implementation"]
+        self.assertEqual(
+            [0, 1, 2],
+            [r.metadata.get("segment_index", 0) for r in implementation],
+        )
+        request_keys = [r.request_key for r in implementation]
+        self.assertEqual(len(request_keys), len(set(request_keys)))
+        continuations = [
+            r for r in implementation if r.metadata.get("segment_index", 0) > 0
+        ]
+        self.assertEqual(
+            ["fake-session-1", "fake-session-1"],
+            [r.metadata["continuation_session_id"] for r in continuations],
+        )
+        self.assertEqual(
+            ["segment:1", "segment:2"],
+            [":".join(r.request_key.split(":")[-2:]) for r in continuations],
+        )
+
+        rows = self._calls("implementation")
+        self.assertEqual([0, 1, 2], [row["segment_index"] for row in rows])
+        self.assertIsNone(rows[0]["continuation_of_call_id"])
+        self.assertEqual(rows[0]["call_id"], rows[1]["continuation_of_call_id"])
+        self.assertEqual(rows[1]["call_id"], rows[2]["continuation_of_call_id"])
+        self.assertIsNone(rows[0]["continuation_session_id"])
+        self.assertEqual(rows[0]["provider_request_id"], "fake-session-1")
+        self.assertEqual(rows[1]["continuation_session_id"], "fake-session-1")
+        self.assertEqual(rows[2]["continuation_session_id"], "fake-session-1")
+        self.assertEqual(InvocationState.COMPLETED.value, rows[2]["state"])
+
+        scheduled = [
+            event["payload_json"]
+            for event in self.database.event_rows("continuation-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual(2, len(scheduled))
+        self.assertEqual([1, 2], [json.loads(p)["segment_index"] for p in scheduled])
+
+    def test_real_adapter_long_step_limit_continues_in_same_session(self) -> None:
+        task = replace(
+            make_task("task-1"),
+            implementation_model=ModelRef(
+                "lmstudio", "qwen/qwen3.8-27b", "1", "qwen", True
+            ),
+            implementation_max_continuations=1,
+        )
+        plan = make_plan(tasks=(task,))
+        fixture = Path(__file__).parent / "fixtures" / "opencode_max_steps_long.jsonl"
+        step_limit_stdout = fixture.read_text(encoding="utf-8")
+        session_id = "session-long-step-limit"
+        done_stdout = json.dumps(
+            {
+                "type": "text",
+                "sessionID": session_id,
+                "part": {"type": "text", "text": "implementation complete"},
+            }
+        )
+
+        class Process:
+            pid = 41242
+            returncode = 0
+
+            def __init__(self, stdout, stderr=""):
+                self.stdout = stdout
+                self.stderr = stderr
+
+            def communicate(self, timeout=None):
+                return self.stdout, self.stderr
+
+        commands: list[list[str]] = []
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command and command[0] == "opencode-stub":
+                commands.append(list(command))
+                if "--session" in command:
+                    worktree = Path(command[command.index("--dir") + 1])
+                    path = worktree / task.expected_outputs[0]
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_text("completed by continuation\n", encoding="utf-8")
+                    return Process(done_stdout)
+                return Process(step_limit_stdout)
+            return real_popen(command, **kwargs)
+
+        adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+        router = AdapterRouter(
+            {"lmstudio": adapter, "fake": FakeAdapter(responder=approved_response)}
+        )
+        runner = Runner(self.database, router, self.workspace)
+        authorization = issue_authorization(plan)
+        with mock.patch("subprocess.Popen", side_effect=popen):
+            result = runner.start(plan, authorization, run_id="real-cont-run")
+
+        self.assertEqual(RunState.COMPLETED, result.state)
+
+        base_commands = [c for c in commands if "--session" not in c]
+        continuation_commands = [c for c in commands if "--session" in c]
+        self.assertEqual(1, len(base_commands))
+        self.assertEqual(1, len(continuation_commands))
+        continuation = continuation_commands[0]
+        self.assertEqual(session_id, continuation[continuation.index("--session") + 1])
+
+        rows = self._calls("implementation")
+        self.assertEqual([0, 1], [row["segment_index"] for row in rows])
+        self.assertEqual(rows[0]["call_id"], rows[1]["continuation_of_call_id"])
+        self.assertEqual(session_id, rows[0]["provider_request_id"])
+        self.assertEqual(session_id, rows[1]["continuation_session_id"])
+        self.assertEqual(InvocationState.FAILED.value, rows[0]["state"])
+        self.assertEqual(InvocationState.COMPLETED.value, rows[1]["state"])
+
+        base_metadata = json.loads(
+            self.database.fetch_one(
+                "SELECT raw_metadata_json FROM model_calls WHERE segment_index = 0 "
+                "AND role = 'implementation'"
+            )["raw_metadata_json"]
+        )
+        self.assertEqual("step_limit_reached", base_metadata["failure_kind"])
+        self.assertEqual("final_text", base_metadata["termination_source"])
+
+        scheduled = [
+            event
+            for event in self.database.event_rows("real-cont-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual(1, len(scheduled))
+        self.assertEqual(1, json.loads(scheduled[0]["payload_json"])["segment_index"])
+
+        self.assertEqual(
+            1,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM test_results")[
+                "count"
+            ],
+        )
+        self.assertEqual(
+            1,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+
+    def test_step_limit_pauses_at_continuation_limit(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=1)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        authorization = issue_authorization(plan)
+        result = runner.start(plan, authorization, run_id="limit-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+        checkpoint = json.loads(
+            self.database.run_snapshot("limit-run")["run"]["checkpoint_json"]
+        )
+        self.assertEqual("implementation_step_limit_reached", checkpoint["reason"])
+        with self.assertRaisesRegex(ValueError, "cannot be continued"):
+            runner.resume("limit-run", plan, authorization)
+
+    def test_step_limit_without_session_id_does_not_continue(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationIncompleteError(
+                    "step limit",
+                    InvocationResult(
+                        None, "CRITICAL - MAXIMUM STEPS REACHED", 11, 5, 2, 37, 0
+                    ),
+                    failure_kind="step_limit_reached",
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="no-session-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+
+    def test_continuation_allowed_rejects_remote_and_reviewer(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        local_impl = {
+            "role": "implementation",
+            "is_local": 1,
+            "segment_index": 0,
+            "provider_request_id": "session-1",
+        }
+        self.assertTrue(Runner._continuation_allowed(task, local_impl))
+        self.assertTrue(
+            Runner._continuation_allowed(task, {**local_impl, "role": "revision"})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "is_local": 0})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "role": "review"})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "role": "rereview"})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "provider_request_id": None})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "provider_request_id": "bad session"})
+        )
+        self.assertFalse(
+            Runner._continuation_allowed(task, {**local_impl, "segment_index": 2})
+        )
+
+    def test_unknown_outcome_does_not_continue(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationOutcomeUnknown("lost", "provider-unknown")
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="unknown-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+
+    def test_file_scope_violation_aborts_continuation(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                path = Path(request.metadata["worktree"]) / "outside.txt"
+                path.write_text("out of scope\n", encoding="utf-8")
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="scope-run")
+        self.assertEqual(RunState.FAILED, result.state)
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+
+    def test_supervised_confirmation_applies_per_segment(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(RunMode.SUPERVISED, (task,))
+        confirmations: list[tuple[str, int]] = []
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) < 2
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        runner = Runner(
+            self.database,
+            FakeAdapter(responder=responder),
+            self.workspace,
+            confirmation_callback=lambda request: (
+                confirmations.append(
+                    (request.role, int(request.metadata.get("segment_index", 0)))
+                )
+                or True
+            ),
+        )
+        result = runner.start(plan, issue_authorization(plan), run_id="supervised-run")
+        self.assertEqual(RunState.COMPLETED, result.state)
+        self.assertEqual(
+            [("implementation", 0), ("implementation", 1), ("implementation", 2), ("review", 0)],
+            confirmations,
+        )
+
+    def test_resume_after_crash_between_segments_continues_once(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) < 1
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        fail_call = self.database.fail_call
+
+        def crash_after_fail(*args, **kwargs):
+            fail_call(*args, **kwargs)
+            raise KeyboardInterrupt("simulated process exit")
+
+        with mock.patch.object(self.database, "fail_call", crash_after_fail):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start(plan, authorization, run_id="crash-run")
+        self.assertEqual(
+            1,
+            len([r for r in adapter.invocations if r.role == "implementation"]),
+        )
+        self.database.close()
+        self.database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        self.database.initialize()
+        recovered = Runner(self.database, adapter, self.workspace).resume(
+            "crash-run", plan, authorization
+        )
+        self.assertEqual(RunState.COMPLETED, recovered.state)
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+        self.assertEqual(2, len(self._calls("implementation")))
+        scheduled = [
+            event
+            for event in self.database.event_rows("crash-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual(1, len(scheduled))
+
+    def test_pause_request_aborts_continuation_before_next_segment(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                self.database.transition_control(
+                    "pause-cont-run", ControlState.PAUSE_REQUESTED
+                )
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="pause-cont-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            ControlState.PAUSED.value,
+            self.database.run_snapshot("pause-cont-run")["run"]["control_state"],
+        )
+        self.assertEqual(
+            [0],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+
+    def test_continuation_reuses_the_actual_fallback_model(self) -> None:
+        task = replace(
+            make_task("task-1"),
+            implementation_max_continuations=2,
+            fallback_model=ModelRef("fake", "coder-fallback", "2", "coder-family", True),
+        )
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role in ("review", "rereview"):
+                return approved_response(request)
+            if request.model.model_id == "coder-fallback":
+                if request.metadata.get("segment_index", 0) < 2:
+                    raise InvocationIncompleteError(
+                        "step limit",
+                        step_limit_result(),
+                        failure_kind="step_limit_reached",
+                    )
+                return approved_response(request)
+            raise ModelUnavailableError("primary unavailable")
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="fallback-run")
+        self.assertEqual(RunState.COMPLETED, result.state)
+        continuations = [
+            r
+            for r in adapter.invocations
+            if r.role == "implementation" and r.metadata.get("segment_index", 0) > 0
+        ]
+        self.assertEqual([1, 2], [r.metadata.get("segment_index", 0) for r in continuations])
+        self.assertTrue(all(r.model == task.fallback_model for r in continuations))
+        self.assertTrue(
+            all(
+                r.metadata.get("continuation_session_id") == "fake-session-1"
+                for r in continuations
+            )
+        )
+
+    def test_session_mismatch_pauses_with_distinct_reason(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                if request.metadata.get("segment_index", 0) == 0:
+                    raise InvocationIncompleteError(
+                        "step limit",
+                        step_limit_result(),
+                        failure_kind="step_limit_reached",
+                    )
+                raise InvocationIncompleteError(
+                    "session mismatch",
+                    step_limit_result(),
+                    failure_kind="session_mismatch",
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(
+            plan, issue_authorization(plan), run_id="session-mismatch-run"
+        )
+        self.assertEqual(RunState.PAUSED, result.state)
+        checkpoint = json.loads(
+            self.database.run_snapshot("session-mismatch-run")["run"]["checkpoint_json"]
+        )
+        self.assertEqual("session_mismatch", checkpoint["reason"])
+        segment_states = [
+            (row["segment_index"], row["state"])
+            for row in self._calls("implementation")
+        ]
+        self.assertIn((1, InvocationState.FAILED.value), segment_states)
+        failed = next(
+            row for row in self.database.connection.execute(
+                "SELECT raw_metadata_json FROM model_calls "
+                "WHERE role = 'implementation' AND segment_index = 1"
+            ).fetchall()
+        )
+        self.assertEqual(
+            "session_mismatch",
+            json.loads(failed["raw_metadata_json"])["failure_kind"],
+        )
+
+    def test_resume_reuses_planned_continuation_without_deadlock(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) < 1
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        begin_call = self.database.begin_call
+        injected: list[bool] = []
+
+        def register_continuation_then_crash(
+            request, attempt_id, *, reuse_planned=False
+        ):
+            if request.metadata.get("segment_index", 0) >= 1 and not injected:
+                injected.append(True)
+                self.database.register_call(request, attempt_id)
+                raise KeyboardInterrupt("simulated crash before start")
+            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+
+        with mock.patch.object(
+            self.database, "begin_call", side_effect=register_continuation_then_crash
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start(plan, authorization, run_id="planned-crash-run")
+
+        planned = self.database.fetch_one(
+            "SELECT COUNT(*) AS count FROM model_calls WHERE state = ?",
+            (InvocationState.PLANNED.value,),
+        )
+        self.assertEqual(1, planned["count"])
+
+        self.database.close()
+        self.database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        self.database.initialize()
+        recovered = Runner(self.database, adapter, self.workspace).resume(
+            "planned-crash-run", plan, authorization
+        )
+        self.assertEqual(RunState.COMPLETED, recovered.state)
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+        self.assertEqual(2, len(self._calls("implementation")))
+        scheduled = [
+            event
+            for event in self.database.event_rows("planned-crash-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual(1, len(scheduled))
+
+    def test_pause_between_gate_and_continuation_start_blocks_adapter(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) == 0
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        begin_call = self.database.begin_call
+        injected: list[bool] = []
+
+        def pause_before_continuation_start(
+            request, attempt_id, *, reuse_planned=False
+        ):
+            if request.metadata.get("segment_index", 0) >= 1 and not injected:
+                injected.append(True)
+                self.database.transition_control(
+                    "pause-toctou-run", ControlState.PAUSE_REQUESTED
+                )
+            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+
+        with mock.patch.object(
+            self.database, "begin_call", side_effect=pause_before_continuation_start
+        ):
+            result = runner.start(plan, authorization, run_id="pause-toctou-run")
+
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            ControlState.PAUSED.value,
+            self.database.run_snapshot("pause-toctou-run")["run"]["control_state"],
+        )
+        checkpoint = json.loads(
+            self.database.run_snapshot("pause-toctou-run")["run"]["checkpoint_json"]
+        )
+        self.assertEqual("before_next_call", checkpoint["boundary"])
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM model_calls WHERE segment_index >= 1"
+            )["count"],
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM model_calls WHERE state = ?",
+                (InvocationState.STARTED.value,),
+            )["count"],
+        )
+        self.assertEqual(
+            [0],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+
+        resumed = runner.resume("pause-toctou-run", plan, authorization)
+        self.assertEqual(RunState.COMPLETED, resumed.state)
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+
+    def test_resume_reuses_initial_planned_call_without_fake_continuation(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        begin_call = self.database.begin_call
+        injected: list[bool] = []
+
+        def register_base_then_crash(request, attempt_id, *, reuse_planned=False):
+            if request.metadata.get("segment_index", 0) == 0 and not injected:
+                injected.append(True)
+                self.database.register_call(request, attempt_id)
+                raise KeyboardInterrupt("simulated crash before base start")
+            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+
+        with mock.patch.object(
+            self.database, "begin_call", side_effect=register_base_then_crash
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start(plan, authorization, run_id="base-planned-run")
+
+        base = self.database.fetch_one(
+            "SELECT call_id, request_key, state, segment_index, "
+            "continuation_of_call_id, continuation_session_id FROM model_calls"
+        )
+        self.assertEqual(InvocationState.PLANNED.value, base["state"])
+        self.assertEqual(0, base["segment_index"])
+        self.assertIsNone(base["continuation_of_call_id"])
+        self.assertIsNone(base["continuation_session_id"])
+        original_call_id = base["call_id"]
+        original_request_key = base["request_key"]
+
+        self.database.close()
+        self.database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        self.database.initialize()
+        recovered = Runner(self.database, adapter, self.workspace).resume(
+            "base-planned-run", plan, authorization
+        )
+        self.assertEqual(RunState.COMPLETED, recovered.state)
+        self.assertEqual(
+            [0],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+        calls = self._calls("implementation")
+        self.assertEqual(1, len(calls))
+        self.assertEqual(original_call_id, calls[0]["call_id"])
+        self.assertEqual(0, calls[0]["segment_index"])
+        persisted = self.database.fetch_one(
+            "SELECT request_key, continuation_of_call_id, continuation_session_id "
+            "FROM model_calls WHERE call_id = ?",
+            (original_call_id,),
+        )
+        self.assertEqual(original_request_key, persisted["request_key"])
+        self.assertIsNone(persisted["continuation_of_call_id"])
+        self.assertIsNone(persisted["continuation_session_id"])
+        implementation_requests = [
+            request for request in adapter.invocations if request.role == "implementation"
+        ]
+        self.assertEqual(1, len(implementation_requests))
+        self.assertEqual(original_call_id, implementation_requests[0].call_id)
+        self.assertEqual(original_request_key, implementation_requests[0].request_key)
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM model_calls "
+                "WHERE continuation_of_call_id = 'None'"
+            )["count"],
+        )
+        scheduled = [
+            event
+            for event in self.database.event_rows("base-planned-run")
+            if event["event_type"] == "continuation.scheduled"
+        ]
+        self.assertEqual([], scheduled)
+        self.assertEqual(0, self.database.unfinished_calls("base-planned-run"))
+
+    def test_malformed_planned_continuation_pauses_without_adapter(self) -> None:
+        cases = [
+            (
+                "segment_zero_with_parent",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET segment_index = 0 WHERE segment_index >= 1"
+                ),
+            ),
+            (
+                "parent_string_none",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET continuation_of_call_id = 'None' "
+                    "WHERE segment_index >= 1"
+                ),
+            ),
+            (
+                "missing_parent",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET continuation_of_call_id = NULL "
+                    "WHERE segment_index >= 1"
+                ),
+            ),
+            (
+                "missing_session",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET continuation_session_id = NULL "
+                    "WHERE segment_index >= 1"
+                ),
+            ),
+            (
+                "invalid_session",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET continuation_session_id = 'bad session' "
+                    "WHERE segment_index >= 1"
+                ),
+            ),
+            (
+                "missing_parent_row",
+                lambda db, run_id, task: db.connection.execute(
+                    "UPDATE model_calls SET continuation_of_call_id = 'no-such-call' "
+                    "WHERE segment_index >= 1"
+                ),
+            ),
+            ("cross_attempt_parent", self._corrupt_cross_attempt_parent),
+        ]
+        for name, corrupt in cases:
+            with self.subTest(case=name):
+                self._assert_malformed_planned_pauses(name, corrupt)
+
+    def _corrupt_cross_attempt_parent(self, db, run_id, task) -> None:
+        db.create_attempt("other-attempt", run_id, task.task_id, 0)
+        other = InvocationRequest(
+            call_id="other-call",
+            request_key="other-request-key",
+            run_id=run_id,
+            task_id=task.task_id,
+            role="implementation",
+            model=task.implementation_model,
+            prompt="seed",
+            data_sensitivity=task.data_sensitivity,
+            read_only=False,
+        )
+        db.register_call(other, "other-attempt")
+        db.connection.execute(
+            "UPDATE model_calls SET continuation_of_call_id = 'other-call' "
+            "WHERE segment_index >= 1"
+        )
+
+    def _assert_malformed_planned_pauses(self, name: str, corrupt) -> None:
+        db_path = self.root / ".agentflow" / "runs" / f"malformed-{name}.db"
+        database = Database(db_path)
+        database.initialize()
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+        run_id = f"malformed-{name}"
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) == 0
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(database, adapter, self.workspace)
+        begin_call = database.begin_call
+        injected: list[bool] = []
+
+        def register_continuation_then_crash(
+            request, attempt_id, *, reuse_planned=False
+        ):
+            if request.metadata.get("segment_index", 0) >= 1 and not injected:
+                injected.append(True)
+                database.register_call(request, attempt_id)
+                raise KeyboardInterrupt("simulated crash before start")
+            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+
+        with mock.patch.object(
+            database, "begin_call", side_effect=register_continuation_then_crash
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start(plan, authorization, run_id=run_id)
+
+        corrupt(database, run_id, task)
+
+        database.close()
+        database = Database(db_path)
+        database.initialize()
+        try:
+            recovered = Runner(database, adapter, self.workspace).resume(
+                run_id, plan, authorization
+            )
+            self.assertEqual(RunState.PAUSED, recovered.state)
+            self.assertEqual(
+                [0],
+                [
+                    r.metadata.get("segment_index", 0)
+                    for r in adapter.invocations
+                    if r.role == "implementation"
+                ],
+            )
+            self.assertEqual(
+                0,
+                database.fetch_one(
+                    "SELECT COUNT(*) AS count FROM model_calls WHERE state = ?",
+                    (InvocationState.STARTED.value,),
+                )["count"],
+            )
+            checkpoint = json.loads(
+                database.run_snapshot(run_id)["run"]["checkpoint_json"]
+            )
+            self.assertEqual("malformed_continuation_metadata", checkpoint["reason"])
+        finally:
+            database.close()
+
+    def test_started_continuation_child_is_not_automatically_retried(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                if request.metadata.get("segment_index", 0) == 0:
+                    raise InvocationIncompleteError(
+                        "step limit",
+                        step_limit_result(),
+                        failure_kind="step_limit_reached",
+                    )
+                raise KeyboardInterrupt("simulated crash during continuation")
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        with self.assertRaises(KeyboardInterrupt):
+            runner.start(plan, authorization, run_id="started-child-run")
+
+        child = self.database.fetch_one(
+            "SELECT state FROM model_calls WHERE segment_index >= 1"
+        )
+        self.assertEqual(InvocationState.STARTED.value, child["state"])
+
+        self.database.close()
+        self.database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        self.database.initialize()
+        with self.assertRaisesRegex(ValueError, "in-flight"):
+            Runner(self.database, adapter, self.workspace).resume(
+                "started-child-run", plan, authorization
+            )
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+
+    def test_completed_continuation_child_is_not_reinvoked(self) -> None:
+        task = replace(make_task("task-1"), implementation_max_continuations=2)
+        plan = make_plan(tasks=(task,))
+        authorization = issue_authorization(plan)
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            if (
+                request.role == "implementation"
+                and request.metadata.get("segment_index", 0) == 0
+            ):
+                raise InvocationIncompleteError(
+                    "step limit", step_limit_result(), failure_kind="step_limit_reached"
+                )
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        complete_call = self.database.complete_call
+
+        def crash_after_completing_continuation(call_id, result, run_id):
+            complete_call(call_id, result, run_id)
+            row = self.database.fetch_one(
+                "SELECT segment_index FROM model_calls WHERE call_id = ?", (call_id,)
+            )
+            if row is not None and int(row["segment_index"]) >= 1:
+                raise KeyboardInterrupt("simulated crash after continuation completed")
+
+        with mock.patch.object(
+            self.database,
+            "complete_call",
+            side_effect=crash_after_completing_continuation,
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                runner.start(plan, authorization, run_id="completed-child-run")
+
+        child = self.database.fetch_one(
+            "SELECT state FROM model_calls WHERE segment_index >= 1"
+        )
+        self.assertEqual(InvocationState.COMPLETED.value, child["state"])
+
+        self.database.close()
+        self.database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        self.database.initialize()
+        recovered = Runner(self.database, adapter, self.workspace).resume(
+            "completed-child-run", plan, authorization
+        )
+        self.assertEqual(RunState.COMPLETED, recovered.state)
+        self.assertEqual(
+            [0, 1],
+            [
+                r.metadata.get("segment_index", 0)
+                for r in adapter.invocations
+                if r.role == "implementation"
+            ],
+        )
+
+    def test_revision_retries_to_max_retry_count(self) -> None:
+        task = replace(make_task("task-1", retries=2), implementation_max_continuations=0)
+        plan = make_plan(tasks=(task,))
+        revisions = 0
+
+        def responder(request: InvocationRequest) -> InvocationResult:
+            nonlocal revisions
+            if request.role == "implementation":
+                return InvocationResult(
+                    f"fake:{request.request_key}", "implemented", 0, 0, 0, 0, 0,
+                    {"test_double": True},
+                )
+            if request.role == "revision":
+                revisions += 1
+                if revisions < 2:
+                    return InvocationResult(
+                        f"fake:{request.request_key}", "still broken", 0, 0, 0, 0, 0,
+                        {"test_double": True},
+                    )
+                return approved_response(request)
+            return approved_response(request)
+
+        adapter = FakeAdapter(responder=responder)
+        runner = Runner(self.database, adapter, self.workspace)
+        result = runner.start(plan, issue_authorization(plan), run_id="revision-run")
+        self.assertEqual(RunState.COMPLETED, result.state)
+        self.assertEqual(
+            ["implementation", "revision", "revision", "rereview"],
+            [r.role for r in adapter.invocations],
+        )
 
 
 if __name__ == "__main__":

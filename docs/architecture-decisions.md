@@ -192,7 +192,7 @@
 
 - 状态：已接受（Owner 于 2026-09-04 明确要求）
 - 决策：步骤上限耗尽等已确认不完整结果使用现有非成功 `failed` 调用终态，并在原始元数据中保存稳定 `failure_kind`；它不是 `completed`，也不是结果不确定的 `UNKNOWN`。适配器优先检查结构化终止事件，无专用字段时才保守匹配最终文本的规范标记。
-- 影响：失败记录保留已确认 Token、耗时、费用和部分输出，Runner 在 implementation/review 各自边界使用不同暂停原因，恢复不得猜测性重试可能产生费用的调用。
+- 影响：失败记录保留已确认 Token、耗时、费用和部分输出，Runner 在 implementation/review 各自边界使用不同暂停原因，恢复不得猜测性重试可能产生费用的调用。非零退出时先解析 stdout 的严格步骤耗尽信号再决定错误分类：正数非零退出且存在严格信号时进入已知不完整路径，否则保持普通执行错误；signal 终止或结果不可确认仍保持 `UNKNOWN`。
 
 ### AD-36：Reviewer 严格 JSON-only 协议
 
@@ -204,6 +204,26 @@
 
 - 状态：已接受（Owner 于 2026-09-04 明确要求）
 - 决策：文件范围和 Reviewer diff 合并 tracked diff 与未跟踪文件，expected output 另行检查存在性。因 `git diff --check` 单独不完整覆盖未跟踪内容，AgentFlow 对未跟踪文本附加明确空白错误检查并单独记录证据。
+
+### AD-38：实现步骤预算字段
+
+- 状态：已接受（Owner 于 2026-09-04 明确要求）
+- 决策：任务合同新增 `implementation_max_steps` 字段，为有限正整数并设置 1–32 硬上限；旧计划未提供时默认 8，保持向后兼容。字段进入 canonical 计划 JSON 与 SHA-256，改变字段使旧授权失效；Runner 将授权值写入本地 implementation 请求元数据，OpenCodeAdapter 从元数据读取并验证后写入 `agentflow-sandbox` 的 `steps`。远程 Reviewer 继续使用独立的固定安全步骤上限。
+- 影响：模型 context 与步骤预算是两个独立参数；本次不修改任何模型的 context。不得从环境变量、未授权 project config 或模型输出覆盖该值，也不得自动选择无限步骤。
+
+### AD-39：本地实施调用超时
+
+- 状态：已接受（Owner 于 2026-09-04 明确要求）
+- 决策：任务合同新增 `implementation_timeout_seconds` 字段（默认 900，范围 60–14400），进入 canonical 计划 JSON 与 SHA-256，改变字段使旧授权失效；布尔、字符串、浮点数及越界值被拒绝。Runner 将授权值写入本地 implementation 请求元数据，OpenCodeAdapter 从元数据读取并验证后作为 `communicate(timeout=...)` 的墙钟超时。超时后终止进程组、收集部分 stdout，保守解析已确认 Token/会话 ID，并以 `InvocationOutcomeUnknown(result=...)` 返回；服务层调用 `mark_call_unknown` 把 `UNKNOWN` 终态与 Token/耗时/会话/`termination_reason=timeout`/`token_source`/`usage_unavailable` 一起持久化，`output_text` 保持空以明确未确认语义，部分 stdout 只以字节数与 SHA-256 记录。
+- 影响：超时是 `UNKNOWN`，不是已知不完整 `failed`，也不自动重试/自测/审核；本地 `remote_cost=0.0` 且 `cost_unavailable=false`。远程 Reviewer 继续使用独立的 `timeout_seconds`，不得意外复用 `implementation_timeout_seconds`。`TimeoutExpired.output` 在真实运行时可能是 `bytes` 而后续 `communicate()` 返回 `str`，必须先在原始字节层统一并消除两段输出的重叠（按重叠前缀合并，UTF-8 多字节截断也安全），合并完成后只解码一次，再按每个真实出现的已完成 step 累加 Token；不得根据事件内容推断重复，因此两个内容完全相同但独立发生的 step 仍各计一次。无可用 usage 时诚实记录 `usage_unavailable`，不得把字段缺失伪造为确认零使用。
+
+### AD-40：本地实施步骤耗尽的同会话分段续接
+
+- 状态：已接受（Owner 于 2026-09-05 明确要求）
+- 决策：本地 implementation/revision 角色因步骤上限耗尽而已知失败时，在全部安全条件满足的前提下，可在同一 OpenCode 会话内以新 segment 续接，而非重启一个全新会话或重试。每个 segment 拥有唯一 `call_id`、幂等 `request_key`（`...:segment:{index}`）、`segment_index` 与 `continuation_of_call_id`，并单独记录 Token、耗时与费用；模型调用表 provider-request 唯一索引改为 `(provider, provider_request_id, segment_index)`，使复用同一会话 ID 的多个 segment 不冲突。续接决定以 `continuation.scheduled` 事件持久化，segment 间进程重启后 resume 只续接一次且不重复已完成 segment。
+- 续接门禁：仅本地模型、implementation/revision 角色、完全相同的模型与 worktree/文件范围、`implementation_max_continuations` 限额内、文件范围核验通过、无暂停/取消/接管，且原调用不是 `UNKNOWN`/超时/signal/费用未知时允许。任一门禁不满足即保持安全暂停，不得续接或重试。远程只读 `review`/`rereview` 永不续接。
+- 影响：续接不是“自动重试”，而是同一会话内延续未完成工作；QA-08 的“不得自动重试”语义不变。多轮修订由 `max_retry_count` 驱动（impl→test→fix→retest），修订提示词携带返回码、stdout/stderr 尾部、缺失输出、未跟踪空白错误、changed files 与剩余验收条件的有界证据；修订角色同样在限额内续接。
+- 实现硬化（P1）：续接子调用必须确定性复用产生父 segment 的实际模型（含回退模型），而非默认 implementation_model；OpenCode 返回的会话 ID 必须与请求复用的 `--session` 完全一致，不一致视为协议错误，记录 `failure_kind=session_mismatch` 并安全暂停，绝不续接测试或审核。`continuation.scheduled` 事件与子调用登记在同一事务内原子写入；进程在“登记后、启动前”崩溃时遗留的 `PLANNED` 子调用按幂等 `request_key` 复用启动，而非死锁或重复登记。每个续接 segment 之前重新检查控制状态，非 `RUNNING` 时在安全边界暂停。
 
 ## 2. 原暂定、经实现验证后接受的决策
 

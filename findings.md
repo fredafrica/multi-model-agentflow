@@ -85,3 +85,16 @@
 - Reviewer prompt 在 packet 外声明严格 JSON-only 协议；解析器拒绝 fenced JSON、夹带散文、缺字段、错误类型与非法 severity，P0/P1 会确定性覆盖错误的 `approved=true`。
 - 未跟踪的计划内输出进入 changed-files、范围门禁、expected-output 检查和 Review Packet；独立补充检查覆盖 `git diff --check` 不检查的未跟踪文本空白错误。
 - 定向测试 54/54、源码完整测试 98/98、wheel 隔离环境完整测试 98/98 均通过；全程只使用明确标记的测试替身或模拟 JSON 事件流。
+
+## 里程碑 17：真实步骤耗尽检测遗漏
+
+- 根因：真实 AgentFlow 运行 `task011-agentflow-v2-20260905`（`implementation_max_steps=32`、`implementation_max_continuations=4`）中，Qwen 的 implementation 与 revision 输出都含 `Maximum steps for this agent have been reached.`，但其形式是“前缀普通文本 + `</think>` + 独立终止行 + 较长 Markdown Summary”。旧 `_text_reports_step_limit` 只重点检查首条非空行或整段规范化 `fullmatch`，整段既非首行又非全文匹配，因此两调用均被记录为 `completed`，随后运行确定性测试并进入新 revision。
+- 修复：改为逐行状态扫描——跟踪 fenced code、忽略缩进/blockquote/diff 内容，仅匹配“规范化后整行等于已接受终止标记”的独立未引用行；同时保留对 `critical maximum steps reached` 与既有说明组合的识别。检测到后 `parse_opencode_json` 抛 `InvocationIncompleteError`（`failure_kind=step_limit_reached`、`termination_source=final_text`）并保留 session ID、Token、费用、耗时与输出证据；退出码 0 与非 0 均正确分类。
+- 误报防护保持：fenced code、blockquote、diff、行内散文、Reviewer JSON 字段引用、无独立终止行的普通摘要均不误判；既有负向测试全部继续通过。
+- 验证：新增 fixture `opencode_max_steps_long.jsonl` 与 5 项回归测试（最小复现、跨 JSONL text event 拆分、退出码 0/非 0 双路径、元数据保留、真实适配器 Runner continuation）；全套 172 项测试通过，compileall 与 `git diff --check` 退出码 0。全部使用明确标记的测试替身，未执行任何真实模型调用。
+
+## 里程碑 17 二轮 P1：行匹配误判 Markdown/引用结构
+
+- 二轮 Codex Review 发现 `_line_is_step_limit_marker` 先用 `re.sub(r"[^a-z0-9]+", " ", line.lower())` 删除标点再匹配，会把标题、加粗/斜体、行内代码、单/双引号和列表包裹的终止短语误判为真实终止并错误触发 continuation。
+- 修复：改为对原始行严格锚定 `re.fullmatch`（`re.IGNORECASE`），仅容忍末尾句号与 CRITICAL 变体的 `-`/`–`/`—` 连字符；不再通过删除所有标点把引用/标题/强调/行内代码/列表折叠成合法标记。fenced code、blockquote、diff、缩进与行内散文的既有误报防护保持不变。
+- 新增负向测试 `test_step_limit_marker_wrapped_in_markdown_or_quotes_is_not_termination`，覆盖 `## `、`**`、`*`、`` ` ``、`"`、`'` 与 `* ` 列表包裹。全套 173 项测试通过，compileall 与 `git diff --check` 退出码 0。未改动 continuation、授权、预算、数据库或远程 Reviewer 逻辑。

@@ -32,7 +32,7 @@ from agentflow.policies import (
     remote_data_decision,
     review_independence_decision,
 )
-from agentflow.serialization import canonical_json, plan_hash
+from agentflow.serialization import canonical_json, load_plan_json, plan_hash
 from agentflow.schema import DDL
 from agentflow.service import (
     ConfirmationRequiredError,
@@ -148,6 +148,124 @@ class AuthorizationTests(unittest.TestCase):
                 plan,
                 now=now,
             )
+
+
+class ImplementationMaxStepsTests(unittest.TestCase):
+    def test_default_is_eight(self) -> None:
+        self.assertEqual(8, make_task().implementation_max_steps)
+
+    def test_valid_boundaries_are_accepted(self) -> None:
+        for value in (1, 32):
+            with self.subTest(value=value):
+                task = replace(make_task(), implementation_max_steps=value)
+                self.assertEqual(value, task.implementation_max_steps)
+
+    def test_invalid_values_are_rejected(self) -> None:
+        for value in (0, -1, 33, True, 8.5, "16"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    replace(make_task(), implementation_max_steps=value)
+
+    def test_plan_json_round_trip_preserves_field(self) -> None:
+        plan = replace(
+            make_plan(), tasks=(replace(make_task(), implementation_max_steps=16),)
+        )
+        restored = load_plan_json(canonical_json(plan))
+        self.assertEqual(16, restored.tasks[0].implementation_max_steps)
+
+    def test_changing_field_changes_hash_and_invalidates_authorization(self) -> None:
+        plan = replace(
+            make_plan(), tasks=(replace(make_task(), implementation_max_steps=12),)
+        )
+        authorization = issue_authorization(plan)
+        validate_authorization(authorization, plan)
+        changed = replace(
+            plan, tasks=(replace(make_task(), implementation_max_steps=13),)
+        )
+        self.assertNotEqual(plan_hash(plan), plan_hash(changed))
+        with self.assertRaisesRegex(ValueError, "plan content changed"):
+            validate_authorization(authorization, changed)
+
+
+class ImplementationTimeoutTests(unittest.TestCase):
+    def test_default_is_nine_hundred(self) -> None:
+        self.assertEqual(900, make_task().implementation_timeout_seconds)
+
+    def test_valid_boundaries_are_accepted(self) -> None:
+        for value in (60, 14400):
+            with self.subTest(value=value):
+                task = replace(make_task(), implementation_timeout_seconds=value)
+                self.assertEqual(value, task.implementation_timeout_seconds)
+
+    def test_invalid_values_are_rejected(self) -> None:
+        for value in (0, -1, 59, 14401, True, 900.0, 60.5, "900"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    replace(make_task(), implementation_timeout_seconds=value)
+
+    def test_plan_json_round_trip_preserves_field(self) -> None:
+        plan = replace(
+            make_plan(),
+            tasks=(replace(make_task(), implementation_timeout_seconds=1800),),
+        )
+        restored = load_plan_json(canonical_json(plan))
+        self.assertEqual(1800, restored.tasks[0].implementation_timeout_seconds)
+
+    def test_changing_field_changes_hash_and_invalidates_authorization(self) -> None:
+        plan = replace(
+            make_plan(),
+            tasks=(replace(make_task(), implementation_timeout_seconds=1800),),
+        )
+        authorization = issue_authorization(plan)
+        validate_authorization(authorization, plan)
+        changed = replace(
+            plan,
+            tasks=(replace(make_task(), implementation_timeout_seconds=1801),),
+        )
+        self.assertNotEqual(plan_hash(plan), plan_hash(changed))
+        with self.assertRaisesRegex(ValueError, "plan content changed"):
+            validate_authorization(authorization, changed)
+
+
+class ImplementationMaxContinuationsTests(unittest.TestCase):
+    def test_default_is_zero(self) -> None:
+        self.assertEqual(0, make_task().implementation_max_continuations)
+
+    def test_valid_boundaries_are_accepted(self) -> None:
+        for value in (0, 8):
+            with self.subTest(value=value):
+                task = replace(make_task(), implementation_max_continuations=value)
+                self.assertEqual(value, task.implementation_max_continuations)
+
+    def test_integral_float_is_coerced(self) -> None:
+        task = replace(make_task(), implementation_max_continuations=4.0)
+        self.assertEqual(4, task.implementation_max_continuations)
+
+    def test_invalid_values_are_rejected(self) -> None:
+        for value in (-1, 9, True, 4.5, "4"):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    replace(make_task(), implementation_max_continuations=value)
+
+    def test_plan_json_round_trip_preserves_field(self) -> None:
+        plan = replace(
+            make_plan(), tasks=(replace(make_task(), implementation_max_continuations=3),)
+        )
+        restored = load_plan_json(canonical_json(plan))
+        self.assertEqual(3, restored.tasks[0].implementation_max_continuations)
+
+    def test_changing_field_changes_hash_and_invalidates_authorization(self) -> None:
+        plan = replace(
+            make_plan(), tasks=(replace(make_task(), implementation_max_continuations=2),)
+        )
+        authorization = issue_authorization(plan)
+        validate_authorization(authorization, plan)
+        changed = replace(
+            plan, tasks=(replace(make_task(), implementation_max_continuations=3),)
+        )
+        self.assertNotEqual(plan_hash(plan), plan_hash(changed))
+        with self.assertRaisesRegex(ValueError, "plan content changed"):
+            validate_authorization(authorization, changed)
 
 
 class ConfigTests(unittest.TestCase):
@@ -471,6 +589,32 @@ class DatabaseTests(unittest.TestCase):
                 for row in legacy.connection.execute("PRAGMA table_info(model_calls)")
             }
             self.assertEqual(0, columns["remote_cost"]["notnull"])
+        finally:
+            legacy.close()
+
+    def test_legacy_provider_request_index_gains_segment_index(self) -> None:
+        legacy_path = Path(self.temp.name) / "legacy-index.db"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.executescript(DDL)
+            connection.execute("DROP INDEX idx_model_calls_provider_request")
+            connection.execute(
+                "CREATE UNIQUE INDEX idx_model_calls_provider_request "
+                "ON model_calls(provider, provider_request_id) "
+                "WHERE provider_request_id IS NOT NULL"
+            )
+        finally:
+            connection.close()
+        legacy = Database(legacy_path)
+        try:
+            legacy.initialize()
+            index_columns = [
+                row["name"]
+                for row in legacy.connection.execute(
+                    "PRAGMA index_info(idx_model_calls_provider_request)"
+                )
+            ]
+            self.assertIn("segment_index", index_columns)
         finally:
             legacy.close()
 

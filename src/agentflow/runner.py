@@ -35,13 +35,20 @@ from .service import (
     ConfirmationRequiredError,
     InvocationContext,
     InvocationService,
+    PauseBlockedError,
     PolicyDeniedError,
 )
-from .states import TASK_TRANSITIONS, ControlState, RunState, TaskState
+from .states import TASK_TRANSITIONS, ControlState, InvocationState, RunState, TaskState
 from .workspace import GitWorkspace
 
 
 ConfirmationCallback = Callable[[InvocationRequest], bool]
+
+
+def _valid_session_id(session_id: str | None) -> bool:
+    if not session_id or not isinstance(session_id, str):
+        return False
+    return all(not (ch.isspace() or ord(ch) < 0x20) for ch in session_id)
 
 
 @dataclass(frozen=True)
@@ -52,6 +59,10 @@ class RunResult:
 
 class ReadOnlyReviewViolation(RuntimeError):
     pass
+
+
+class MalformedCallMetadataError(RuntimeError):
+    """A stored model call lacks the metadata needed to continue safely."""
 
 
 REVIEWER_OUTPUT_PROTOCOL = """Reviewer output protocol (mandatory):
@@ -109,9 +120,10 @@ class Runner:
             raise ValueError(
                 "run has an UNKNOWN model call that must be reconciled before resume"
             )
-        if self.database.known_incomplete_calls(run_id):
+        if self._has_blocking_incomplete_call(run_id, plan):
             raise ValueError(
-                "run has a known incomplete model call that must not be retried"
+                "run has a step-limit model call that cannot be continued; "
+                "inspect it before resuming"
             )
         if control is ControlState.RUNNING:
             if self.database.inflight_calls(run_id):
@@ -165,13 +177,14 @@ class Runner:
                     )
                 self._complete_safe_pause(run_id, task.task_id, "unknown_model_call")
                 return RunResult(run_id, RunState.PAUSED)
-            except InvocationIncompleteError:
+            except InvocationIncompleteError as error:
                 state = self.database.task_state(run_id, task.task_id)
-                reason = (
-                    "review_step_limit_reached"
-                    if state in (TaskState.WAITING_REVIEW, TaskState.WAITING_REREVIEW)
-                    else "implementation_step_limit_reached"
-                )
+                if error.failure_kind == "session_mismatch":
+                    reason = "session_mismatch"
+                elif state in (TaskState.WAITING_REVIEW, TaskState.WAITING_REREVIEW):
+                    reason = "review_step_limit_reached"
+                else:
+                    reason = "implementation_step_limit_reached"
                 self._complete_safe_pause(run_id, task.task_id, reason)
                 return RunResult(run_id, RunState.PAUSED)
             except ReviewerProtocolError:
@@ -209,6 +222,9 @@ class Runner:
             if self.database.task_state(run_id, task.task_id) is TaskState.FAILED:
                 self.database.set_run_state(run_id, RunState.FAILED)
                 return RunResult(run_id, RunState.FAILED)
+        if self.database.unfinished_calls(run_id):
+            self.database.set_run_state(run_id, RunState.FAILED)
+            return RunResult(run_id, RunState.FAILED)
         self.database.set_run_state(run_id, RunState.COMPLETED)
         return RunResult(run_id, RunState.COMPLETED)
 
@@ -236,18 +252,17 @@ class Runner:
                 attempt_id, number = self._attempt_for_role(
                     run_id, task.task_id, "implementation"
                 )
-                self._invoke_role(
+                if not self._drive_local_role(
                     run_id,
                     plan,
                     authorization,
                     task,
                     attempt_id,
                     number,
-                    "implementation",
-                    task.implementation_model,
                     worktree,
-                    read_only=False,
-                )
+                    role="implementation",
+                ):
+                    return
                 if not self._files_are_allowed(task, worktree):
                     self.database.complete_attempt(attempt_id, "file_scope_failed")
                     self._move_to_failed(run_id, task.task_id)
@@ -298,27 +313,33 @@ class Runner:
                 attempt_id, number = self._attempt_for_role(
                     run_id, task.task_id, "revision"
                 )
-                self._invoke_role(
-                    run_id,
-                    plan,
-                    authorization,
-                    task,
-                    attempt_id,
-                    number,
-                    "revision",
-                    task.implementation_model,
-                    worktree,
-                    read_only=False,
-                )
-                files_ok = self._files_are_allowed(task, worktree)
-                tests_ok = files_ok and self._run_tests(run_id, task, attempt_id, worktree)
-                if not tests_ok:
+                while True:
+                    if not self._drive_local_role(
+                        run_id,
+                        plan,
+                        authorization,
+                        task,
+                        attempt_id,
+                        number,
+                        worktree,
+                        role="revision",
+                        prompt=self._revision_prompt(run_id, task, worktree),
+                    ):
+                        return
+                    files_ok = self._files_are_allowed(task, worktree)
+                    tests_ok = files_ok and self._run_tests(
+                        run_id, task, attempt_id, worktree
+                    )
+                    if tests_ok:
+                        self.database.transition_task(
+                            run_id, task.task_id, TaskState.WAITING_REREVIEW
+                        )
+                        break
                     self.database.complete_attempt(attempt_id, "revision_failed")
-                    self._move_to_failed(run_id, task.task_id)
-                    return
-                self.database.transition_task(
-                    run_id, task.task_id, TaskState.WAITING_REREVIEW
-                )
+                    if number - 1 >= task.max_retry_count:
+                        self._move_to_failed(run_id, task.task_id)
+                        return
+                    attempt_id, number = self._new_attempt(run_id, task.task_id)
                 if self._pause_if_requested(run_id, task.task_id):
                     return
                 continue
@@ -394,9 +415,13 @@ class Runner:
         read_only: bool,
         prompt: str | None = None,
         audit_metadata: dict[str, object] | None = None,
+        reuse_planned: bool = False,
+        planned_call_id: str | None = None,
+        planned_request_key: str | None = None,
     ) -> tuple[InvocationResult, ModelRef]:
         candidates: list[ModelRef] = []
-        for candidate in (model, task.fallback_model):
+        recovery_candidates = (model,) if reuse_planned else (model, task.fallback_model)
+        for candidate in recovery_candidates:
             if candidate is None or candidate in candidates:
                 continue
             if read_only and not review_independence_decision(
@@ -408,7 +433,7 @@ class Runner:
             raise ReviewerUnavailableError("reviewer independence denied")
         first_denial: PolicyDeniedError | ReviewerUnavailableError | None = None
         for candidate in candidates:
-            call_id = str(uuid4())
+            call_id = planned_call_id or str(uuid4())
             selected_adapter = (
                 self.adapter.adapter_for(candidate.provider)
                 if isinstance(self.adapter, AdapterRouter)
@@ -416,7 +441,8 @@ class Runner:
             )
             request = InvocationRequest(
                 call_id=call_id,
-                request_key=(
+                request_key=planned_request_key
+                or (
                     f"{run_id}:{task.task_id}:{attempt_number}:{role}:"
                     f"{candidate.registry_key}"
                 ),
@@ -430,6 +456,8 @@ class Runner:
                 metadata={
                     "worktree": str(worktree),
                     "allowed_files": task.allowed_files,
+                    "implementation_max_steps": task.implementation_max_steps,
+                    "implementation_timeout_seconds": task.implementation_timeout_seconds,
                     "estimated_remote_cost": (
                         0 if candidate.is_local else task.max_remote_cost
                     ),
@@ -456,7 +484,9 @@ class Runner:
                 else task.max_remote_cost,
             )
             try:
-                return self._invoke_with_confirmation(request, context), candidate
+                return self._invoke_with_confirmation(
+                    request, context, reuse_planned=reuse_planned
+                ), candidate
             except (PolicyDeniedError, ReviewerUnavailableError) as error:
                 first_denial = first_denial or error
                 if candidate == candidates[-1]:
@@ -473,14 +503,386 @@ class Runner:
         raise PolicyDeniedError("no independent authorized model is available for this role")
 
     def _invoke_with_confirmation(
-        self, request: InvocationRequest, context: InvocationContext
+        self,
+        request: InvocationRequest,
+        context: InvocationContext,
+        *,
+        reuse_planned: bool = False,
     ) -> InvocationResult:
         try:
-            return self.invocations.invoke(request, context, confirmed=False)
+            return self.invocations.invoke(
+                request, context, confirmed=False, reuse_planned=reuse_planned
+            )
         except ConfirmationRequiredError:
             if not self.confirmation_callback(request):
                 raise
-            return self.invocations.invoke(request, context, confirmed=True)
+            return self.invocations.invoke(
+                request, context, confirmed=True, reuse_planned=reuse_planned
+            )
+
+    def _drive_local_role(
+        self,
+        run_id: str,
+        plan: PlanContract,
+        authorization: AuthorizationSnapshot,
+        task: TaskContract,
+        attempt_id: str,
+        number: int,
+        worktree: Path,
+        *,
+        role: str,
+        prompt: str | None = None,
+    ) -> bool:
+        """Invoke a local write role, resuming the same session across segments.
+
+        Returns ``True`` when the role call completed and the worktree stayed
+        inside the allowed file scope, or ``False`` when a file-scope violation
+        already failed the task. Step-limit terminations are continued in a new
+        segment of the same OpenCode session up to ``implementation_max_continuations``.
+        """
+        model = task.implementation_model
+        last = self.database.latest_role_call(attempt_id, role)
+        if last is not None and last["state"] == InvocationState.COMPLETED.value:
+            return True
+        base_planned = (
+            last is not None
+            and last["state"] == InvocationState.PLANNED.value
+            and self._classify_planned_call(attempt_id, role, last) == "base"
+        )
+        if last is None or base_planned:
+            try:
+                if base_planned:
+                    model = self._model_from_call(last)
+                self._invoke_role(
+                    run_id,
+                    plan,
+                    authorization,
+                    task,
+                    attempt_id,
+                    number,
+                    role,
+                    model,
+                    worktree,
+                    read_only=False,
+                    prompt=prompt,
+                    reuse_planned=base_planned,
+                    planned_call_id=str(last["call_id"]) if base_planned else None,
+                    planned_request_key=(
+                        str(last["request_key"]) if base_planned else None
+                    ),
+                )
+            except MalformedCallMetadataError:
+                self._complete_safe_pause(
+                    run_id, task.task_id, "malformed_base_call_metadata"
+                )
+                return False
+            except PauseBlockedError:
+                self._complete_safe_pause(run_id, task.task_id, "pause_requested")
+                return False
+            except InvocationIncompleteError as error:
+                if error.failure_kind != "step_limit_reached":
+                    raise
+            else:
+                return True
+        while True:
+            if self._continuation_pause_requested(run_id, task.task_id):
+                return False
+            last = self.database.latest_role_call(attempt_id, role)
+            if last is None or last["state"] == InvocationState.COMPLETED.value:
+                return True
+            state = InvocationState(last["state"])
+            try:
+                if state is InvocationState.PLANNED:
+                    if self._classify_planned_call(attempt_id, role, last) != "continuation":
+                        raise MalformedCallMetadataError(
+                            "stored PLANNED call has malformed continuation metadata"
+                        )
+                    if not self._files_are_allowed(task, worktree):
+                        self.database.complete_attempt(attempt_id, "file_scope_failed")
+                        self._move_to_failed(run_id, task.task_id)
+                        return False
+                    model = self._model_from_call(last)
+                    segment_index = int(last["segment_index"])
+                    continuation_of_call_id = str(last["continuation_of_call_id"])
+                    session_id = last["continuation_session_id"]
+                elif state is InvocationState.FAILED:
+                    metadata = (
+                        json.loads(last["raw_metadata_json"])
+                        if last["raw_metadata_json"]
+                        else {}
+                    )
+                    if metadata.get("failure_kind") != "step_limit_reached":
+                        raise InvocationIncompleteError(
+                            "local invocation did not complete and cannot be continued",
+                            self._incomplete_result(last),
+                            failure_kind=metadata.get("failure_kind")
+                            or "step_limit_reached",
+                        )
+                    if not self._continuation_allowed(task, last):
+                        raise InvocationIncompleteError(
+                            "implementation step limit reached without an authorized continuation",
+                            self._incomplete_result(last),
+                            failure_kind="step_limit_reached",
+                        )
+                    if not self._files_are_allowed(task, worktree):
+                        self.database.complete_attempt(attempt_id, "file_scope_failed")
+                        self._move_to_failed(run_id, task.task_id)
+                        return False
+                    model = self._model_from_call(last)
+                    segment_index = int(last["segment_index"]) + 1
+                    continuation_of_call_id = str(last["call_id"])
+                    session_id = last["provider_request_id"]
+                else:
+                    raise InvocationIncompleteError(
+                        "local invocation did not complete and cannot be continued",
+                        self._incomplete_result(last),
+                        failure_kind="step_limit_reached",
+                    )
+            except MalformedCallMetadataError:
+                self._complete_safe_pause(
+                    run_id, task.task_id, "malformed_continuation_metadata"
+                )
+                return False
+            try:
+                self._invoke_continuation(
+                    run_id,
+                    plan,
+                    authorization,
+                    task,
+                    attempt_id,
+                    number,
+                    role,
+                    model,
+                    worktree,
+                    segment_index=segment_index,
+                    continuation_of_call_id=continuation_of_call_id,
+                    session_id=session_id,
+                )
+            except PauseBlockedError:
+                self._complete_safe_pause(run_id, task.task_id, "pause_requested")
+                return False
+            except InvocationIncompleteError as error:
+                if error.failure_kind != "step_limit_reached":
+                    raise
+                continue
+            return True
+
+    def _invoke_continuation(
+        self,
+        run_id: str,
+        plan: PlanContract,
+        authorization: AuthorizationSnapshot,
+        task: TaskContract,
+        attempt_id: str,
+        number: int,
+        role: str,
+        model: ModelRef,
+        worktree: Path,
+        *,
+        segment_index: int,
+        continuation_of_call_id: str,
+        session_id: str | None,
+    ) -> InvocationResult:
+        request_key = (
+            f"{run_id}:{task.task_id}:{number}:{role}:{model.registry_key}"
+            f":segment:{segment_index}"
+        )
+        existing = self.database.fetch_one(
+            "SELECT call_id, state FROM model_calls WHERE request_key = ?",
+            (request_key,),
+        )
+        if (
+            existing is not None
+            and InvocationState(existing["state"]) is InvocationState.PLANNED
+        ):
+            call_id = str(existing["call_id"])
+        else:
+            call_id = str(uuid4())
+        selected_adapter = (
+            self.adapter.adapter_for(model.provider)
+            if isinstance(self.adapter, AdapterRouter)
+            else self.adapter
+        )
+        request = InvocationRequest(
+            call_id=call_id,
+            request_key=request_key,
+            run_id=run_id,
+            task_id=task.task_id,
+            role=role,
+            model=model,
+            prompt=self._continuation_prompt(task),
+            data_sensitivity=task.data_sensitivity,
+            read_only=False,
+            metadata={
+                "worktree": str(worktree),
+                "allowed_files": task.allowed_files,
+                "implementation_max_steps": task.implementation_max_steps,
+                "implementation_timeout_seconds": task.implementation_timeout_seconds,
+                "estimated_remote_cost": 0 if model.is_local else task.max_remote_cost,
+                "test_double": bool(getattr(selected_adapter, "test_double", False)),
+                "segment_index": segment_index,
+                "continuation_of_call_id": continuation_of_call_id,
+                "continuation_session_id": session_id,
+                "on_provider_request_id": (
+                    lambda provider_request_id, call_id=call_id: (
+                        self.database.set_provider_request_id(call_id, provider_request_id)
+                    )
+                ),
+            },
+        )
+        context = InvocationContext(
+            plan,
+            task,
+            authorization,
+            attempt_id,
+            estimated_remote_cost=0 if model.is_local else task.max_remote_cost,
+        )
+        return self._invoke_with_confirmation(request, context, reuse_planned=True)
+
+    @staticmethod
+    def _continuation_allowed(task: TaskContract, last) -> bool:
+        if last["role"] not in ("implementation", "revision"):
+            return False
+        if not last["is_local"]:
+            return False
+        if not _valid_session_id(last["provider_request_id"]):
+            return False
+        return int(last["segment_index"]) + 1 <= task.implementation_max_continuations
+
+    @staticmethod
+    def _model_from_call(call) -> ModelRef:
+        provider = call["provider"]
+        model_id = call["model_id"]
+        version = call["model_version"]
+        family = call["model_family"]
+        if not provider or not model_id or not version or not family:
+            raise MalformedCallMetadataError(
+                "stored model call is missing provider/model/version/family metadata"
+            )
+        return ModelRef(
+            provider=str(provider),
+            model_id=str(model_id),
+            version=str(version),
+            family=str(family),
+            is_local=bool(call["is_local"]),
+        )
+
+    def _classify_planned_call(self, attempt_id: str, role: str, call) -> str:
+        """Classify a PLANNED call as ``base``, ``continuation``, or ``malformed``.
+
+        A call is base only when ``segment_index == 0`` and both
+        ``continuation_of_call_id`` and ``continuation_session_id`` are NULL. A
+        call is a continuation only when ``segment_index >= 1``, its
+        ``continuation_of_call_id`` names a real parent call in the same
+        attempt/role chain, and its ``continuation_session_id`` is a valid
+        session ID. Every other combination is malformed.
+        """
+        segment_index = int(call["segment_index"] or 0)
+        parent = call["continuation_of_call_id"]
+        session_id = call["continuation_session_id"]
+        if segment_index == 0:
+            if parent is None and session_id is None:
+                return "base"
+            return "malformed"
+        if not isinstance(parent, str) or parent == "None" or not _valid_session_id(parent):
+            return "malformed"
+        if not _valid_session_id(session_id):
+            return "malformed"
+        parent_row = self.database.fetch_one(
+            "SELECT attempt_id, role, segment_index, provider_request_id, "
+            "provider, model_id, model_version, model_family, is_local "
+            "FROM model_calls WHERE call_id = ?",
+            (parent,),
+        )
+        if parent_row is None:
+            return "malformed"
+        if parent_row["attempt_id"] != attempt_id or parent_row["role"] != role:
+            return "malformed"
+        if int(parent_row["segment_index"] or 0) != segment_index - 1:
+            return "malformed"
+        if parent_row["provider_request_id"] != session_id:
+            return "malformed"
+        for field in (
+            "provider",
+            "model_id",
+            "model_version",
+            "model_family",
+            "is_local",
+        ):
+            if parent_row[field] != call[field]:
+                return "malformed"
+        return "continuation"
+
+    @staticmethod
+    def _incomplete_result(last) -> InvocationResult:
+        return InvocationResult(
+            provider_request_id=last["provider_request_id"],
+            output="",
+            input_tokens=0,
+            output_tokens=0,
+            first_token_latency_ms=None,
+            duration_ms=0,
+            remote_cost=0.0,
+            raw_metadata={"failure_kind": "step_limit_reached"},
+            cost_unavailable=False,
+        )
+
+    @staticmethod
+    def _continuation_prompt(task: TaskContract) -> str:
+        criteria = "\n".join(f"- {item}" for item in task.acceptance_criteria)
+        forbidden = "\n".join(f"- {item}" for item in task.forbidden_actions)
+        return (
+            "You are continuing a previous implementation segment in the same isolated "
+            "Git worktree and OpenCode session. Do not re-investigate the whole repository.\n"
+            "1. Inspect the current diff and any still-missing expected outputs first.\n"
+            "2. Prioritize completing any expected output that is still missing.\n"
+            "3. For large files, create a minimal importable skeleton first, then grow it "
+            "with several small edit/apply_patch calls, confirming the file exists after each.\n"
+            "4. Never submit a single oversized write and never repeat a write call that is "
+            "missing its content argument; if a write tool reports a schema error, shrink the "
+            "patch and retry.\n"
+            "5. Do not bypass file permissions via shell heredoc, cat redirection, or external "
+            "scripts.\n"
+            "6. Complete the implementation and self-check; do not only summarize remaining work.\n\n"
+            f"Objective: {task.objective}\n"
+            f"Acceptance criteria:\n{criteria}\n"
+            f"Forbidden actions:\n{forbidden}"
+        )
+
+    def _revision_prompt(self, run_id: str, task: TaskContract, worktree: Path) -> str:
+        test = self.database.latest_test(run_id, task.task_id)
+        evidence: dict[str, object] = {}
+        if test is not None:
+            evidence = json.loads(test["evidence_json"])
+        criteria = "\n".join(f"- {item}" for item in task.acceptance_criteria)
+        forbidden = "\n".join(f"- {item}" for item in task.forbidden_actions)
+        missing = evidence.get("missing_outputs", ()) or ()
+        changed = self.workspace.changed_files(worktree)
+        parts = [
+            "The deterministic tests for this task failed. Fix the implementation and "
+            "complete the missing expected outputs before the tests are re-run.",
+            f"Objective: {task.objective}",
+            f"Acceptance criteria:\n{criteria}",
+            f"Forbidden actions:\n{forbidden}",
+            f"Test return code: {evidence.get('returncode')}",
+            f"Missing expected outputs: {', '.join(str(item) for item in missing) or '(none)'}",
+            f"Changed files: {', '.join(changed) or '(none)'}",
+        ]
+        stderr = str(evidence.get("stderr", ""))[-4000:]
+        if stderr:
+            parts.append(f"Test stderr (tail):\n{stderr}")
+        stdout = str(evidence.get("stdout", ""))[-4000:]
+        if stdout:
+            parts.append(f"Test stdout (tail):\n{stdout}")
+        return "\n\n".join(parts)
+
+    def _has_blocking_incomplete_call(self, run_id: str, plan: PlanContract) -> bool:
+        tasks = {task.task_id: task for task in plan.tasks}
+        for call in self.database.step_limit_calls_without_continuation(run_id):
+            task = tasks.get(call["task_id"])
+            if task is None or not self._continuation_allowed(task, call):
+                return True
+        return False
 
     @staticmethod
     def _implementation_prompt(task: TaskContract) -> str:
@@ -693,6 +1095,13 @@ class Runner:
                 "untracked_whitespace_errors", ()
             ),
         }
+
+    def _continuation_pause_requested(self, run_id: str, task_id: str) -> bool:
+        control = ControlState(self.database.run_snapshot(run_id)["run"]["control_state"])
+        if control is ControlState.RUNNING:
+            return False
+        self._complete_safe_pause(run_id, task_id, "pause_requested")
+        return True
 
     def _pause_if_requested(self, run_id: str, task_id: str) -> bool:
         snapshot = self.database.run_snapshot(run_id)

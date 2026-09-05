@@ -95,7 +95,6 @@ class CliTests(unittest.TestCase):
         code, output, _ = self.call("plan", "show")
         self.assertEqual(0, code)
         self.assertEqual(plan_hash(self.plan), json.loads(output)["sha256"])
-
         code, _, error = self.call("plan", "authorize", "--hash", "wrong")
         self.assertEqual(2, code)
         self.assertIn("does not match", error)
@@ -233,6 +232,12 @@ class CliTests(unittest.TestCase):
                 finally:
                     connection.close()
                 self.assertEqual("unknown", state)
+
+    def test_plan_show_includes_implementation_timeout(self) -> None:
+        code, output, _ = self.call("plan", "show")
+        self.assertEqual(0, code)
+        task = json.loads(output)["plan"]["tasks"][0]
+        self.assertEqual(900, task["implementation_timeout_seconds"])
 
 
 if __name__ == "__main__":

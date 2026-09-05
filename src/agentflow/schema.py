@@ -97,13 +97,16 @@ CREATE TABLE IF NOT EXISTS model_calls (
     remote_cost REAL,
     cost_unavailable INTEGER NOT NULL DEFAULT 0 CHECK (cost_unavailable IN (0, 1)),
     test_double INTEGER NOT NULL DEFAULT 0 CHECK (test_double IN (0, 1)),
+    segment_index INTEGER NOT NULL DEFAULT 0 CHECK (segment_index >= 0),
+    continuation_of_call_id TEXT,
+    continuation_session_id TEXT,
     started_at TEXT,
     finished_at TEXT,
     FOREIGN KEY (attempt_id) REFERENCES attempts(attempt_id)
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_model_calls_provider_request
-ON model_calls(provider, provider_request_id)
+ON model_calls(provider, provider_request_id, segment_index)
 WHERE provider_request_id IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS test_results (

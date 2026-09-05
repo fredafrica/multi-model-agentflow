@@ -77,6 +77,17 @@ class Severity(StringEnum):
     P3 = "P3"
 
 
+DEFAULT_IMPLEMENTATION_MAX_STEPS = 8
+IMPLEMENTATION_MAX_STEPS_LIMIT = 32
+
+DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 900
+IMPLEMENTATION_TIMEOUT_SECONDS_MIN = 60
+IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT = 14400
+
+DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS = 0
+IMPLEMENTATION_MAX_CONTINUATIONS_LIMIT = 8
+
+
 @dataclass(frozen=True)
 class RiskLevel:
     business_importance: BusinessImportance
@@ -142,10 +153,26 @@ class TaskContract:
     expected_outputs: tuple[str, ...]
     depends_on: tuple[str, ...] = ()
     test_command: tuple[str, ...] = ()
+    implementation_max_steps: int = DEFAULT_IMPLEMENTATION_MAX_STEPS
+    implementation_timeout_seconds: int = DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
+    implementation_max_continuations: int = DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "max_remote_cost", float(self.max_remote_cost))
         object.__setattr__(self, "max_retry_count", int(self.max_retry_count))
+        object.__setattr__(
+            self, "implementation_max_steps", _coerce_step_budget(self.implementation_max_steps)
+        )
+        object.__setattr__(
+            self,
+            "implementation_timeout_seconds",
+            _coerce_timeout_seconds(self.implementation_timeout_seconds),
+        )
+        object.__setattr__(
+            self,
+            "implementation_max_continuations",
+            _coerce_continuations(self.implementation_max_continuations),
+        )
         if not self.task_id or not self.objective:
             raise ValueError("task_id and objective are required")
         if self.max_remote_cost < 0 or self.max_retry_count < 0:
@@ -345,6 +372,52 @@ class ReviewResult:
         blocking = any(item.severity in (Severity.P0, Severity.P1) for item in self.findings)
         if self.approved and blocking:
             raise ValueError("P0/P1 findings prevent approval")
+
+
+def _coerce_step_budget(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("implementation_max_steps must be a positive integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("implementation_max_steps must be a positive integer")
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError("implementation_max_steps must be a positive integer")
+    if not 1 <= value <= IMPLEMENTATION_MAX_STEPS_LIMIT:
+        raise ValueError(
+            "implementation_max_steps must be between 1 and "
+            f"{IMPLEMENTATION_MAX_STEPS_LIMIT}"
+        )
+    return value
+
+
+def _coerce_timeout_seconds(value: Any) -> int:
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, int):
+        raise ValueError("implementation_timeout_seconds must be an integer")
+    if not IMPLEMENTATION_TIMEOUT_SECONDS_MIN <= value <= IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT:
+        raise ValueError(
+            "implementation_timeout_seconds must be between "
+            f"{IMPLEMENTATION_TIMEOUT_SECONDS_MIN} and "
+            f"{IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT}"
+        )
+    return value
+
+
+def _coerce_continuations(value: Any) -> int:
+    if isinstance(value, bool):
+        raise ValueError("implementation_max_continuations must be a non-negative integer")
+    if isinstance(value, float):
+        if not value.is_integer():
+            raise ValueError("implementation_max_continuations must be a non-negative integer")
+        value = int(value)
+    if not isinstance(value, int):
+        raise ValueError("implementation_max_continuations must be a non-negative integer")
+    if not 0 <= value <= IMPLEMENTATION_MAX_CONTINUATIONS_LIMIT:
+        raise ValueError(
+            "implementation_max_continuations must be between 0 and "
+            f"{IMPLEMENTATION_MAX_CONTINUATIONS_LIMIT}"
+        )
+    return value
 
 
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")

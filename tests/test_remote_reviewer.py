@@ -306,6 +306,55 @@ class RemoteAdapterTests(unittest.TestCase):
             with self.assertRaises(InvocationIncompleteError):
                 adapter.invoke(review_request())
 
+    def test_nonzero_exit_step_limit_is_incomplete_not_unavailable(self) -> None:
+        fixture = Path(__file__).parent / "fixtures" / "opencode_max_steps.jsonl"
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+
+        class NonZeroProcess:
+            pid = 41237
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return fixture.read_text(encoding="utf-8"), ""
+
+        adapter = RemoteOpenCodeReviewerAdapter(PROVIDER, opencode_command="stub")
+        with mock.patch("subprocess.run", return_value=discovery), mock.patch(
+            "subprocess.Popen", return_value=NonZeroProcess()
+        ):
+            with self.assertRaises(InvocationIncompleteError) as raised:
+                adapter.invoke(review_request())
+        error = raised.exception
+        self.assertEqual("step_limit_reached", error.failure_kind)
+        result = error.result
+        self.assertEqual("session-step-limit", result.provider_request_id)
+        self.assertEqual((17, 9), (result.input_tokens, result.output_tokens))
+        self.assertEqual(0.125, result.remote_cost)
+        self.assertFalse(result.cost_unavailable)
+
+    def test_nonzero_exit_without_step_limit_signal_is_model_unavailable(self) -> None:
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+        stdout = json.dumps(
+            {"type": "text", "sessionID": "s", "part": {"type": "text", "text": "partial"}}
+        )
+
+        class NonZeroProcess:
+            pid = 41238
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return stdout, "model unavailable"
+
+        adapter = RemoteOpenCodeReviewerAdapter(PROVIDER, opencode_command="stub")
+        with mock.patch("subprocess.run", return_value=discovery), mock.patch(
+            "subprocess.Popen", return_value=NonZeroProcess()
+        ):
+            with self.assertRaises(ModelUnavailableError):
+                adapter.invoke(review_request())
+
 
 class RemotePolicyTests(unittest.TestCase):
     def test_provider_authorization_role_privacy_and_budget_are_pre_call_gates(self) -> None:
@@ -958,9 +1007,88 @@ class ReviewPacketTests(unittest.TestCase):
                 "confirmed_remote_cost_usd"
             ],
         )
-        with self.assertRaisesRegex(ValueError, "must not be retried"):
+        with self.assertRaisesRegex(ValueError, "cannot be continued"):
             runner.resume("review-step-limit-run", plan, authorization)
         self.assertEqual(1, len(remote.invocations))
+
+    def test_nonzero_exit_reviewer_step_limit_pauses_without_review_row(self) -> None:
+        task = remote_task()
+        plan = replace(remote_plan(task), max_remote_cost=1)
+        fixture = Path(__file__).parent / "fixtures" / "opencode_max_steps.jsonl"
+        stdout = fixture.read_text(encoding="utf-8")
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+
+        class NonZeroProcess:
+            pid = 41239
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return stdout, ""
+
+        def local_response(request: InvocationRequest) -> InvocationResult:
+            return InvocationResult(
+                f"fake:{request.request_key}",
+                "implementation complete",
+                0,
+                0,
+                0,
+                1,
+                0,
+                {"test_double": True},
+            )
+
+        local = FakeAdapter(responder=local_response)
+        remote = RemoteOpenCodeReviewerAdapter(PROVIDER, opencode_command="stub")
+        runner = Runner(
+            self.database,
+            AdapterRouter({"fake": local, PROVIDER: remote}),
+            self.workspace,
+        )
+        authorization = issue_authorization(plan)
+        real_run = subprocess.run
+        real_popen = subprocess.Popen
+
+        def run_side_effect(args, **kwargs):
+            if args and args[0] == "stub":
+                return discovery
+            return real_run(args, **kwargs)
+
+        def popen_side_effect(command, **kwargs):
+            if command and command[0] == "stub":
+                return NonZeroProcess()
+            return real_popen(command, **kwargs)
+
+        with mock.patch("subprocess.run", side_effect=run_side_effect), mock.patch(
+            "subprocess.Popen", side_effect=popen_side_effect
+        ):
+            result = runner.start(
+                plan, authorization, run_id="review-nonzero-step-limit-run"
+            )
+        self.assertEqual("paused", result.state.value)
+        checkpoint = json.loads(
+            self.database.run_snapshot("review-nonzero-step-limit-run")["run"][
+                "checkpoint_json"
+            ]
+        )
+        self.assertEqual("review_step_limit_reached", checkpoint["reason"])
+        self.assertEqual(
+            0,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+        call = self.database.fetch_one(
+            "SELECT state, input_tokens, output_tokens, remote_cost, "
+            "cost_unavailable FROM model_calls WHERE role = 'review'"
+        )
+        self.assertEqual("failed", call["state"])
+        self.assertEqual((17, 9, 0.125), tuple(
+            call[key] for key in ("input_tokens", "output_tokens", "remote_cost")
+        ))
+        self.assertEqual(0, call["cost_unavailable"])
+        with self.assertRaisesRegex(ValueError, "cannot be continued"):
+            runner.resume("review-nonzero-step-limit-run", plan, authorization)
+        self.assertEqual(1, len(local.invocations))
 
 
 class RemoteCliStubTests(unittest.TestCase):

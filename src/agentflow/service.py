@@ -31,6 +31,10 @@ class ConfirmationRequiredError(RuntimeError):
     pass
 
 
+class PauseBlockedError(RuntimeError):
+    """The run was no longer RUNNING when a call tried to start."""
+
+
 @dataclass(frozen=True)
 class InvocationContext:
     plan: PlanContract
@@ -52,6 +56,7 @@ class InvocationService:
         context: InvocationContext,
         *,
         confirmed: bool = False,
+        reuse_planned: bool = False,
     ) -> InvocationResult:
         validate_authorization(context.authorization, context.plan)
         decision = invocation_decision(
@@ -75,25 +80,26 @@ class InvocationService:
         if decision.requires_confirmation and not confirmed:
             raise ConfirmationRequiredError("this invocation requires explicit confirmation")
 
-        row, created = self.database.register_call(request, context.attempt_id)
-        if not created:
-            return InvocationResult(
-                provider_request_id=row["provider_request_id"],
-                output=str(row["output_text"] or ""),
-                input_tokens=int(row["input_tokens"] or 0),
-                output_tokens=int(row["output_tokens"] or 0),
-                first_token_latency_ms=row["first_token_latency_ms"],
-                duration_ms=int(row["duration_ms"] or 0),
-                remote_cost=(
-                    float(row["remote_cost"])
-                    if row["remote_cost"] is not None
-                    else None
-                ),
-                raw_metadata={"reused": True},
-                cost_unavailable=bool(row["cost_unavailable"]),
-            )
+        row, outcome = self.database.begin_call(
+            request, context.attempt_id, reuse_planned=reuse_planned
+        )
+        if outcome == "PAUSE_BLOCKED":
+            raise PauseBlockedError("run is no longer running; call was not started")
+        if outcome == "REUSED_COMPLETED":
+            return self._reused_result(row)
 
-        self.database.transition_call(request.call_id, InvocationState.STARTED)
+        call_id = str(row["call_id"])
+        if call_id != request.call_id:
+            metadata = dict(request.metadata)
+            metadata["on_provider_request_id"] = (
+                lambda provider_request_id, call_id=call_id: (
+                    self.database.set_provider_request_id(
+                        call_id, provider_request_id
+                    )
+                )
+            )
+            request = replace(request, call_id=call_id, metadata=metadata)
+
         try:
             result = self.adapter.invoke(request)
         except InvocationIncompleteError as error:
@@ -102,24 +108,53 @@ class InvocationService:
                 result = replace(result, remote_cost=0.0, cost_unavailable=False)
                 error.result = result
             self.database.fail_call(
-                request.call_id,
+                call_id,
                 result,
                 request.run_id,
                 failure_kind=error.failure_kind,
             )
             raise
         except InvocationOutcomeUnknown as error:
-            if error.provider_request_id:
-                self.database.set_provider_request_id(request.call_id, error.provider_request_id)
-            self.database.transition_call(request.call_id, InvocationState.UNKNOWN)
+            if error.result is not None:
+                result = error.result
+                if request.model.is_local:
+                    result = replace(result, remote_cost=0.0, cost_unavailable=False)
+                    error.result = result
+                self.database.mark_call_unknown(
+                    call_id, error.provider_request_id, result
+                )
+            else:
+                if error.provider_request_id:
+                    self.database.set_provider_request_id(
+                        call_id, error.provider_request_id
+                    )
+                self.database.transition_call(call_id, InvocationState.UNKNOWN)
             raise
         except Exception:
-            self.database.transition_call(request.call_id, InvocationState.FAILED)
+            self.database.transition_call(call_id, InvocationState.FAILED)
             raise
         if request.model.is_local:
             result = replace(result, remote_cost=0.0, cost_unavailable=False)
-        self.database.complete_call(request.call_id, result, request.run_id)
+        self.database.complete_call(call_id, result, request.run_id)
         return result
+
+    @staticmethod
+    def _reused_result(row) -> InvocationResult:
+        return InvocationResult(
+            provider_request_id=row["provider_request_id"],
+            output=str(row["output_text"] or ""),
+            input_tokens=int(row["input_tokens"] or 0),
+            output_tokens=int(row["output_tokens"] or 0),
+            first_token_latency_ms=row["first_token_latency_ms"],
+            duration_ms=int(row["duration_ms"] or 0),
+            remote_cost=(
+                float(row["remote_cost"])
+                if row["remote_cost"] is not None
+                else None
+            ),
+            raw_metadata={"reused": True},
+            cost_unavailable=bool(row["cost_unavailable"]),
+        )
 
     def resolve_unknown(self, run_id: str, call_id: str) -> InvocationResult | None:
         row = self.database.unknown_call(run_id, call_id)
