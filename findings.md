@@ -69,3 +69,19 @@
 - 代码简化审查移除了可推导的本地/远程重复状态，修正了恢复时丢失模型输出、已完成运行可被强制暂停、依赖环以及后备审核模型记录不准确等问题。
 - 文档统一使用 `.agentflow/project.toml`，CLI、Skill 和需求文档已补齐 `handoff` 与 `resolve-call`，没有发现剩余矛盾。
 - 仓库仍在 `main` 分支且没有提交，符合用户约束。
+
+## 里程碑 10：真实故障语义
+
+- 当前本机 OpenCode 版本为 `1.18.27`。OpenCode 官方 Agents 文档将 `steps` 定义为模型 agentic iterations 的正数上限；达到最后允许步骤时，工具被移除并强制模型输出文本总结。因此 `steps=1` 会把 Reviewer 的首次模型回合直接变成上限收尾回合，不是“允许一次正式答复”。
+- 对无工具、packet-only Reviewer，`2` 是允许一次正常审核回合、同时仍保留有限燔断的最小步骤预算；实现应提取语义常量并用测试防止回退为 `1`。
+- 现有 `parse_opencode_json()` 只要提取到任意 text event 就构造普通 `InvocationResult`；OpenCode 退出码为 0 时，`InvocationService` 无条件写入 `completed`，是 implementation/review 同时误判的共同根因。
+- 现有调用状态 `FAILED` 足以表达“结果已知且失败”；不需要增加 schema 枚举。但需要新增带类型原因和部分 `InvocationResult` 的专用异常，并在 `FAILED` 行中保留 token、耗时、费用、输出及结构化 `failure_kind`。
+- Remote Reviewer 当前将所有 JSON event 解析失败包装成 `ModelUnavailableError`，Runner 又统一暂停为 `reviewer_unavailable`；步骤耗尽必须保留为独立已知失败语义。
+- `GitWorkspace.changed_files()` 已把 tracked diff 和 `git ls-files --others --exclude-standard` 合并，`diff()` 也将未跟踪文本内容加入 Review Packet，`_run_tests()` 单独检查 expected output 存在。缺口是对未跟踪新文件的空白错误没有补充性确定检查，且文档不应把 `git diff --check` 表述为覆盖所有未跟踪内容。
+
+## 里程碑 11–13：修复与验证结论
+
+- 步骤耗尽现在保存为 `FAILED` 调用及明确 `failure_kind`，保留输出、Token、耗时、费用与原始元数据；Runner 分别以 `implementation_step_limit_reached` 或 `review_step_limit_reached` 暂停，且恢复时不会重复调用。
+- Reviewer prompt 在 packet 外声明严格 JSON-only 协议；解析器拒绝 fenced JSON、夹带散文、缺字段、错误类型与非法 severity，P0/P1 会确定性覆盖错误的 `approved=true`。
+- 未跟踪的计划内输出进入 changed-files、范围门禁、expected-output 检查和 Review Packet；独立补充检查覆盖 `git diff --check` 不检查的未跟踪文本空白错误。
+- 定向测试 54/54、源码完整测试 98/98、wheel 隔离环境完整测试 98/98 均通过；全程只使用明确标记的测试替身或模拟 JSON 事件流。

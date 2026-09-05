@@ -2,13 +2,21 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from uuid import uuid4
 
-from .adapters import InvocationOutcomeUnknown, ModelAdapter
+from .adapters import (
+    AdapterRouter,
+    InvocationIncompleteError,
+    InvocationOutcomeUnknown,
+    ModelAdapter,
+    ReviewerProtocolError,
+    ReviewerUnavailableError,
+)
 from .authorization import validate_authorization
 from .contracts import (
     AuthorizationSnapshot,
@@ -44,6 +52,18 @@ class RunResult:
 
 class ReadOnlyReviewViolation(RuntimeError):
     pass
+
+
+REVIEWER_OUTPUT_PROTOCOL = """Reviewer output protocol (mandatory):
+- Return exactly one JSON object and nothing else.
+- Do not use a Markdown code fence, preface, summary, or explanatory prose.
+- The top-level object must contain approved (boolean) and findings (array).
+- Every finding must contain severity (P0, P1, P2, or P3), title (string), and explanation (string).
+- A finding may also contain path (project-relative string) and remediation (string).
+- If any P0 or P1 finding exists, approved must not be true.
+
+Review packet (JSON data):
+"""
 
 
 class Runner:
@@ -85,6 +105,14 @@ class Runner:
         validate_authorization(authorization, plan)
         snapshot = self.database.run_snapshot(run_id)
         control = ControlState(snapshot["run"]["control_state"])
+        if self.database.unresolved_unknown_calls(run_id):
+            raise ValueError(
+                "run has an UNKNOWN model call that must be reconciled before resume"
+            )
+        if self.database.known_incomplete_calls(run_id):
+            raise ValueError(
+                "run has a known incomplete model call that must not be retried"
+            )
         if control is ControlState.RUNNING:
             if self.database.inflight_calls(run_id):
                 raise ValueError(
@@ -93,8 +121,6 @@ class Runner:
             return self.execute(run_id, plan, authorization)
         if control not in (ControlState.PAUSED, ControlState.USER_TAKEOVER):
             raise ValueError("only paused or takeover runs can resume")
-        if self.database.unresolved_unknown_calls(run_id):
-            raise ValueError("run has an UNKNOWN model call that must be reconciled before resume")
         self._restore_resolved_tasks(run_id, plan)
         if control is ControlState.USER_TAKEOVER:
             self._invalidate_takeover_changes(run_id, plan)
@@ -139,6 +165,23 @@ class Runner:
                     )
                 self._complete_safe_pause(run_id, task.task_id, "unknown_model_call")
                 return RunResult(run_id, RunState.PAUSED)
+            except InvocationIncompleteError:
+                state = self.database.task_state(run_id, task.task_id)
+                reason = (
+                    "review_step_limit_reached"
+                    if state in (TaskState.WAITING_REVIEW, TaskState.WAITING_REREVIEW)
+                    else "implementation_step_limit_reached"
+                )
+                self._complete_safe_pause(run_id, task.task_id, reason)
+                return RunResult(run_id, RunState.PAUSED)
+            except ReviewerProtocolError:
+                self._complete_safe_pause(
+                    run_id, task.task_id, "reviewer_output_invalid"
+                )
+                return RunResult(run_id, RunState.PAUSED)
+            except ReviewerUnavailableError:
+                self._complete_safe_pause(run_id, task.task_id, "reviewer_unavailable")
+                return RunResult(run_id, RunState.PAUSED)
             except ReadOnlyReviewViolation:
                 self._move_to_failed(run_id, task.task_id)
                 self.database.set_run_state(run_id, RunState.FAILED)
@@ -176,11 +219,6 @@ class Runner:
         authorization: AuthorizationSnapshot,
         task: TaskContract,
     ) -> None:
-        independence = review_independence_decision(task)
-        if not independence.allowed:
-            self.database.transition_task(run_id, task.task_id, TaskState.WAITING_INPUT)
-            self._complete_safe_pause(run_id, task.task_id, "stronger_review_required")
-            return
         worktree = self._ensure_worktree(run_id, task)
 
         while True:
@@ -355,18 +393,33 @@ class Runner:
         *,
         read_only: bool,
         prompt: str | None = None,
+        audit_metadata: dict[str, object] | None = None,
     ) -> tuple[InvocationResult, ModelRef]:
-        candidates = [model]
-        if task.fallback_model is not None and task.fallback_model != model:
-            fallback_task = replace(task, review_model=task.fallback_model)
-            if not read_only or review_independence_decision(fallback_task).allowed:
-                candidates.append(task.fallback_model)
-        first_denial: PolicyDeniedError | None = None
+        candidates: list[ModelRef] = []
+        for candidate in (model, task.fallback_model):
+            if candidate is None or candidate in candidates:
+                continue
+            if read_only and not review_independence_decision(
+                replace(task, review_model=candidate)
+            ).allowed:
+                continue
+            candidates.append(candidate)
+        if not candidates:
+            raise ReviewerUnavailableError("reviewer independence denied")
+        first_denial: PolicyDeniedError | ReviewerUnavailableError | None = None
         for candidate in candidates:
             call_id = str(uuid4())
+            selected_adapter = (
+                self.adapter.adapter_for(candidate.provider)
+                if isinstance(self.adapter, AdapterRouter)
+                else self.adapter
+            )
             request = InvocationRequest(
                 call_id=call_id,
-                request_key=f"{run_id}:{task.task_id}:{attempt_number}:{role}",
+                request_key=(
+                    f"{run_id}:{task.task_id}:{attempt_number}:{role}:"
+                    f"{candidate.registry_key}"
+                ),
                 run_id=run_id,
                 task_id=task.task_id,
                 role=role,
@@ -377,7 +430,12 @@ class Runner:
                 metadata={
                     "worktree": str(worktree),
                     "allowed_files": task.allowed_files,
-                    "test_double": candidate.provider == "fake",
+                    "estimated_remote_cost": (
+                        0 if candidate.is_local else task.max_remote_cost
+                    ),
+                    "test_double": bool(
+                        getattr(selected_adapter, "test_double", False)
+                    ),
                     "on_provider_request_id": (
                         lambda provider_request_id, call_id=call_id: (
                             self.database.set_provider_request_id(
@@ -385,6 +443,7 @@ class Runner:
                             )
                         )
                     ),
+                    **(audit_metadata or {}),
                 },
             )
             context = InvocationContext(
@@ -398,7 +457,7 @@ class Runner:
             )
             try:
                 return self._invoke_with_confirmation(request, context), candidate
-            except PolicyDeniedError as error:
+            except (PolicyDeniedError, ReviewerUnavailableError) as error:
                 first_denial = first_denial or error
                 if candidate == candidates[-1]:
                     raise first_denial
@@ -440,7 +499,14 @@ class Runner:
         missing_outputs = tuple(
             path for path in task.expected_outputs if not (worktree / path).is_file()
         )
-        passed = result.passed and not missing_outputs
+        untracked_whitespace_errors = self.workspace.untracked_whitespace_errors(
+            worktree
+        )
+        passed = (
+            result.passed
+            and not missing_outputs
+            and not untracked_whitespace_errors
+        )
         self.database.record_test(
             str(uuid4()),
             run_id,
@@ -456,6 +522,7 @@ class Runner:
                 "stderr": result.stderr,
                 "duration_ms": result.duration_ms,
                 "missing_outputs": missing_outputs,
+                "untracked_whitespace_errors": untracked_whitespace_errors,
             },
         )
         return passed
@@ -477,28 +544,43 @@ class Runner:
         before = self.workspace.status_snapshot(worktree)
         diff = self.workspace.diff(worktree)
         test = self.database.latest_test(run_id, task.task_id)
-        prompt = json.dumps(
-            {
-                "objective": task.objective,
-                "acceptance_criteria": task.acceptance_criteria,
-                "diff": diff,
-                "deterministic_test": {
-                    "passed": bool(test["passed"]),
-                    "duration_ms": test["duration_ms"],
-                    "evidence": json.loads(test["evidence_json"]),
-                }
-                if test is not None
-                else None,
-                "expected_response": {
-                    "approved": "boolean",
-                    "findings": [
-                        {"severity": "P0|P1|P2|P3", "summary": "text", "evidence": "text"}
-                    ],
-                },
+        packet = {
+            "task_id": task.task_id,
+            "objective": task.objective,
+            "risk_level": {
+                "business_importance": task.risk_level.business_importance.value,
+                "operational_safety": task.risk_level.operational_safety.value,
             },
+            "acceptance_criteria": task.acceptance_criteria,
+            "forbidden_actions": task.forbidden_actions,
+            "diff": diff,
+            "deterministic_test": self._review_test_evidence(test),
+            "evidence_excerpts": (),
+            "review_questions": (
+                "Does the actual diff satisfy every acceptance criterion?",
+                "Do tests and evidence reveal any P0-P3 finding?",
+            ),
+            "expected_response": {
+                "approved": "boolean",
+                "findings": [
+                    {
+                        "severity": "P0|P1|P2|P3",
+                        "title": "text",
+                        "explanation": "text",
+                        "path": "optional project-relative path",
+                        "remediation": "optional text",
+                    }
+                ],
+            },
+        }
+        packet_json = json.dumps(
+            packet,
             ensure_ascii=False,
             sort_keys=True,
+            separators=(",", ":"),
         )
+        prompt = REVIEWER_OUTPUT_PROTOCOL + packet_json
+        packet_bytes = packet_json.encode("utf-8")
         attempt_number = int(self._require_attempt(run_id, task.task_id)["attempt_number"])
         result, reviewer = self._invoke_role(
             run_id,
@@ -512,10 +594,20 @@ class Runner:
             worktree,
             read_only=True,
             prompt=prompt,
+            audit_metadata={
+                "packet_hash": hashlib.sha256(packet_bytes).hexdigest(),
+                "packet_size": len(packet_bytes),
+                "privacy_policy_version": plan.privacy_policy_version,
+            },
         )
         if self.workspace.status_snapshot(worktree) != before:
             raise ReadOnlyReviewViolation("reviewer modified the worktree")
-        review = self._parse_review(task, reviewer, result.output)
+        try:
+            review = self._parse_review(task, reviewer, result.output)
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+            raise ReviewerProtocolError(
+                "reviewer output did not satisfy the required JSON protocol"
+            ) from error
         self.database.record_review(
             review.review_id,
             run_id,
@@ -532,22 +624,75 @@ class Runner:
     @staticmethod
     def _parse_review(task: TaskContract, reviewer: ModelRef, text: str) -> ReviewResult:
         data = json.loads(text)
-        findings = tuple(
-            ReviewFinding(
-                severity=Severity(item["severity"]),
-                summary=str(item["summary"]),
-                evidence=str(item["evidence"]),
-                blocking=item["severity"] in ("P0", "P1"),
+        if not isinstance(data, dict):
+            raise ValueError("review output must be a JSON object")
+        if "approved" not in data or not isinstance(data["approved"], bool):
+            raise ValueError("review approved must be a boolean")
+        if "findings" not in data or not isinstance(data["findings"], list):
+            raise ValueError("review findings must be an array")
+        findings_list: list[ReviewFinding] = []
+        for item in data["findings"]:
+            if not isinstance(item, dict):
+                raise ValueError("every review finding must be an object")
+            for field in ("severity", "title", "explanation"):
+                if field not in item:
+                    raise ValueError(f"review finding is missing {field}")
+            if not isinstance(item["severity"], str):
+                raise ValueError("review finding severity must be a string")
+            severity = Severity(item["severity"])
+            if not isinstance(item["title"], str) or not item["title"]:
+                raise ValueError("review finding title must be a non-empty string")
+            if not isinstance(item["explanation"], str) or not item["explanation"]:
+                raise ValueError(
+                    "review finding explanation must be a non-empty string"
+                )
+            for field in ("path", "remediation"):
+                if field in item and (
+                    not isinstance(item[field], str) or not item[field]
+                ):
+                    raise ValueError(
+                        f"review finding {field} must be a non-empty string"
+                    )
+            findings_list.append(
+                ReviewFinding(
+                    severity=severity,
+                    title=item["title"],
+                    explanation=item["explanation"],
+                    blocking=severity in (Severity.P0, Severity.P1),
+                    path=item.get("path"),
+                    remediation=item.get("remediation"),
+                )
             )
-            for item in data.get("findings", [])
-        )
+        findings = tuple(findings_list)
         return ReviewResult(
             review_id=str(uuid4()),
             task_id=task.task_id,
             reviewer=reviewer,
             findings=findings,
-            approved=bool(data["approved"]),
+            approved=data["approved"]
+            and not any(
+                finding.severity in (Severity.P0, Severity.P1)
+                for finding in findings
+            ),
         )
+
+    @staticmethod
+    def _review_test_evidence(test) -> dict[str, object] | None:
+        if test is None:
+            return None
+        evidence = json.loads(test["evidence_json"])
+        return {
+            "passed": bool(test["passed"]),
+            "duration_ms": test["duration_ms"],
+            "command": evidence.get("command", ()),
+            "returncode": evidence.get("returncode"),
+            "stdout_excerpt": str(evidence.get("stdout", ""))[-20_000:],
+            "stderr_excerpt": str(evidence.get("stderr", ""))[-20_000:],
+            "missing_outputs": evidence.get("missing_outputs", ()),
+            "untracked_whitespace_errors": evidence.get(
+                "untracked_whitespace_errors", ()
+            ),
+        }
 
     def _pause_if_requested(self, run_id: str, task_id: str) -> bool:
         snapshot = self.database.run_snapshot(run_id)

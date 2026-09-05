@@ -14,6 +14,11 @@ class SkillTests(unittest.TestCase):
         text = SKILL.read_text(encoding="utf-8")
         self.assertIn("It is never authorization to start a model", text)
         self.assertLess(text.index("plan authorize"), text.index("start <plan-id>"))
+        self.assertIn("configured/discoverable status is not proof", text)
+        self.assertIn("only for `review`/`rereview`", text)
+        self.assertIn("real smoke test requires its own plan", text)
+        self.assertIn("known failed call", text)
+        self.assertIn("protocol-valid JSON object", text)
         self.assertIn("allow_implicit_invocation: true", OPENAI_YAML.read_text())
 
     def test_skill_has_no_permanent_model_default(self) -> None:

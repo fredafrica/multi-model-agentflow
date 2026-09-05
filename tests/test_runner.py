@@ -9,7 +9,11 @@ from pathlib import Path
 from unittest import mock
 
 from agentflow.authorization import issue_authorization
-from agentflow.adapters import AdapterRouter, InvocationOutcomeUnknown
+from agentflow.adapters import (
+    AdapterRouter,
+    InvocationIncompleteError,
+    InvocationOutcomeUnknown,
+)
 from agentflow.contracts import (
     BudgetMode,
     BusinessImportance,
@@ -26,7 +30,7 @@ from agentflow.contracts import (
 from agentflow.database import Database
 from agentflow.fake_adapter import FakeAdapter
 from agentflow.runner import Runner
-from agentflow.states import ControlState, RunState, TaskState
+from agentflow.states import ControlState, InvocationState, RunState, TaskState
 from agentflow.workspace import GitWorkspace, GitWorkspaceError
 
 
@@ -224,6 +228,44 @@ class RunnerTests(unittest.TestCase):
         ).start(plan, issue_authorization(plan), run_id="missing-output-run")
         self.assertEqual(RunState.FAILED, result.state)
 
+    def test_untracked_output_whitespace_is_checked_beyond_git_diff_check(self) -> None:
+        task = replace(
+            make_task("task-1", retries=0),
+            test_command=("git", "diff", "--check"),
+        )
+        plan = make_plan(tasks=(task,))
+
+        def write_untracked_trailing_whitespace(
+            request: InvocationRequest,
+        ) -> InvocationResult:
+            if request.role == "implementation":
+                path = Path(request.metadata["worktree"]) / task.expected_outputs[0]
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("untracked output with trailing whitespace \n")
+            return InvocationResult(
+                f"fake:{request.request_key}",
+                "implementation complete",
+                0,
+                0,
+                0,
+                0,
+                0,
+                {"test_double": True},
+            )
+
+        adapter = FakeAdapter(responder=write_untracked_trailing_whitespace)
+        result = Runner(self.database, adapter, self.workspace).start(
+            plan,
+            issue_authorization(plan),
+            run_id="untracked-whitespace-run",
+        )
+        self.assertEqual(RunState.FAILED, result.state)
+        self.assertEqual(["implementation"], [item.role for item in adapter.invocations])
+        test = self.database.latest_test("untracked-whitespace-run", task.task_id)
+        evidence = json.loads(test["evidence_json"])
+        self.assertEqual(0, evidence["returncode"])
+        self.assertTrue(evidence["untracked_whitespace_errors"])
+
     def test_uncommitted_project_does_not_leave_active_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -284,7 +326,7 @@ class RunnerTests(unittest.TestCase):
         ).start(plan, issue_authorization(plan), run_id="review-wait-run")
         self.assertEqual(RunState.PAUSED, result.state)
         self.assertEqual(
-            TaskState.WAITING_INPUT,
+            TaskState.WAITING_REVIEW,
             self.database.task_state("review-wait-run", task.task_id),
         )
 
@@ -319,7 +361,11 @@ class RunnerTests(unittest.TestCase):
                     {
                         "approved": False,
                         "findings": [
-                            {"severity": "P1", "summary": "fix", "evidence": "test"}
+                            {
+                                "severity": "P1",
+                                "title": "fix",
+                                "explanation": "test",
+                            }
                         ],
                     }
                 )
@@ -433,6 +479,71 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(RunState.PAUSED, result.state)
         with self.assertRaises(ValueError):
             runner.resume("unknown-run", plan, authorization)
+        self.assertEqual(1, len(adapter.invocations))
+
+    def test_implementation_step_limit_pauses_before_tests_or_review(self) -> None:
+        task = make_task("task-1")
+        plan = make_plan(tasks=(task,))
+        partial = InvocationResult(
+            "fake-step-limit",
+            "CRITICAL - MAXIMUM STEPS REACHED",
+            11,
+            5,
+            2,
+            37,
+            0,
+            {"test_double": True},
+        )
+
+        def incomplete(_request: InvocationRequest) -> InvocationResult:
+            raise InvocationIncompleteError(
+                "step limit",
+                partial,
+                failure_kind="step_limit_reached",
+            )
+
+        adapter = FakeAdapter(responder=incomplete)
+        runner = Runner(self.database, adapter, self.workspace)
+        authorization = issue_authorization(plan)
+        result = runner.start(
+            plan, authorization, run_id="implementation-step-limit-run"
+        )
+        self.assertEqual(RunState.PAUSED, result.state)
+        self.assertEqual(
+            TaskState.RUNNING,
+            self.database.task_state("implementation-step-limit-run", task.task_id),
+        )
+        self.assertEqual(["implementation"], [item.role for item in adapter.invocations])
+        self.assertEqual(
+            0,
+            self.database.fetch_one(
+                "SELECT COUNT(*) AS count FROM test_results"
+            )["count"],
+        )
+        self.assertEqual(
+            0,
+            self.database.fetch_one("SELECT COUNT(*) AS count FROM reviews")["count"],
+        )
+        call = self.database.fetch_one(
+            "SELECT state, input_tokens, output_tokens, duration_ms, raw_metadata_json "
+            "FROM model_calls"
+        )
+        self.assertEqual(InvocationState.FAILED.value, call["state"])
+        self.assertEqual((11, 5, 37), tuple(call[key] for key in (
+            "input_tokens", "output_tokens", "duration_ms"
+        )))
+        self.assertEqual(
+            "step_limit_reached",
+            json.loads(call["raw_metadata_json"])["failure_kind"],
+        )
+        checkpoint = json.loads(
+            self.database.run_snapshot("implementation-step-limit-run")["run"][
+                "checkpoint_json"
+            ]
+        )
+        self.assertEqual("implementation_step_limit_reached", checkpoint["reason"])
+        with self.assertRaisesRegex(ValueError, "must not be retried"):
+            runner.resume("implementation-step-limit-run", plan, authorization)
         self.assertEqual(1, len(adapter.invocations))
 
     def test_resolved_unknown_call_resumes_without_second_invocation(self) -> None:

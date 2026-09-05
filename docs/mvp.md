@@ -1,6 +1,6 @@
 # 第一版 MVP
 
-状态：已实现并完成本地验收（2026-09-04）
+状态：本地 MVP 已验收；OpenCode 远程只读 Reviewer 扩展已获授权并进入实现（2026-09-04）
 
 ## 1. MVP 目标
 
@@ -15,6 +15,7 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 一次只运行一个已授权执行计划。
 - 一个计划包含 3 个串行任务；数据结构允许第 4 个任务，但验收不依赖它。
 - 每个实施任务使用独立 Git worktree，并受 `allowed_files` 限制。
+- 计划内未跟踪新文件同样进入范围、Review Packet、expected-output 和补充空白错误检查；`git diff --check` 只按 Git 本身语义报告。
 - 实施模型完成工作与自测；确定性程序运行门禁；全新上下文的审核模型只读审核；重要或关键任务必须跨模型家族，修复后由原审核方复审。
 - 阻断问题清零后才能批准，不能以模型自述代替证据。
 
@@ -27,8 +28,8 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 
 ### 2.3 模型与路由
 
-- 通过可插拔接口调用模型；OpenCode → LM Studio 是 MVP 唯一必须真实验证的路径。
-- 提供无费用测试替身验证授权、预算、失败和收费幂等场景；DeepSeek 等远程真实适配器推迟到 MVP 后。
+- 通过可插拔接口调用模型；OpenCode → LM Studio 继续是本地实现路径。
+- 提供无费用测试替身验证授权、预算、失败和收费幂等场景；新增 OpenCode remote-provider 通用 Reviewer 路径，但不增加供应商专属直连核心。
 - 模型和版本来自注册表与运行时发现，不在 Skill 中写死。
 - 最小路由支持用户直接指定角色模型，以及本地优先策略。
 - 注册表实现 MVP 所需的可用性、版本、信任、成本/速度和最高风险字段；未接入候选只展示，不执行。
@@ -49,6 +50,7 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 等待优先消费进程、文件或任务状态事件；无事件接口时由非 LLM 程序检查；最终后备才采用指数退避。
 - 支持安全暂停、立即冻结、人工接管和恢复。一次外部进程或模型请求是安全暂停的最小不可中断单元；返回后在下一次调用前保存检查点。
 - 重启恢复执行幂等检查：已完成任务和已完成收费调用不重复。
+- 步骤上限耗尽作为带原因的已知失败，保留 Token、耗时和已确认费用；实施结果不进入自测/审核，Reviewer 结果不产生 review 记录，两者均安全暂停且不自动重试。
 - 收费调用结果未知时先按请求 ID 查询；无法确认则进入 `UNKNOWN` 并暂停，不自动重试。
 - 人工修改后基于 Git 差异和文件哈希，只失效受影响结果。
 
@@ -58,13 +60,25 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 生成人工接管摘要，使用户能够回到 OpenCode 或普通 Terminal 工作流继续。
 - 项目仓库只跟踪非敏感策略；运行记录、调用内容和敏感数据默认不进入 Git。用户级数据路径遵循平台惯例并允许环境变量覆盖。
 
+### 2.7 OpenCode 远程只读 Reviewer 扩展
+
+- provider 与精确模型来自计划和授权快照，并在调用前通过 OpenCode 的无推理模型列表验证为已配置且可发现。
+- 远程 provider 只允许 `review`/`rereview`，必须 `read_only=true`，并禁用编辑、Shell、外部目录、网页、任务/子 Agent、Skill 和交互升级。
+- packet-only Reviewer 使用足以完成一次正常答复且仍有限的步骤预算；Reviewer prompt 在 packet 外强制只返回一个无 Markdown/散文包装的 JSON 对象。
+- Reviewer 结果严格验证 `approved` boolean、`findings` array、P0-P3 严重度与必填字符串字段；非结构化输出和带 P0/P1 的 `approved=true` 均不能形成批准。
+- Reviewer 不接收仓库工作区，只接收 AgentFlow 生成的最小 Review Packet；发送审计只持久化 SHA-256、大小、模型和隐私策略等元数据。
+- D0-D3、密钥/路径扫描、可用预算、应急预留和跨家族独立性在进程启动前执行；当前没有完整自动 D2 脱敏，因此 D2 默认拒绝，不能伪造 `redaction_passed`。
+- OpenCode 报告的远程费用按调用记录；未报告费用时记录 `cost_unavailable`，不伪造零。
+- configured/discoverable 只表示接入候选，不等于 `callable_verified`。真实 smoke test 必须使用另一个明确计划和哈希批准，本次开发任务不执行。
+
 ## 3. 明确不做
 
 - 网页控制台、手机端或云端控制平面；
 - 多机调度、复杂并行调度或组织级权限系统；
 - 自动安装运行环境、自动下载/加载模型或建立完整市场模型目录；
 - 自动注册供应商账号、购买/充值额度、申请/保存密钥或修改供应商配置；
-- DeepSeek 或其他远程供应商的真实 MVP 适配器；
+- 绕过 OpenCode 的供应商专属远程直连适配器；
+- 未经独立计划和哈希批准的真实远程 smoke test，或把 configured/discoverable 记为 callable_verified；
 - 开机自动服务；
 - 将金融规则写进通用核心；
 - 用 AI 模型实现状态机、预算、锁、等待或确定性测试；
@@ -96,12 +110,19 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 | MVP-A16 | 模拟收费请求已经发出但响应丢失。 | 系统先按请求 ID 查询；无法确认时进入 `UNKNOWN` 并暂停，模型调用和费用记录中没有自动重试。 | COST-05, STATE-03 |
 | MVP-A17 | 在追加事件与更新状态投影之间模拟进程故障。 | 单一 SQLite 事务全部提交或全部回滚；恢复后事件与当前状态一致。 | STATE-01, STATE-04, STORE-03 |
 | MVP-A18 | 分别审核普通任务和重要/关键任务。 | 普通任务可以同家族但必须全新只读上下文且不含实施解释；重要/关键任务必须跨家族，否则等待更强审核。 | QA-03 |
+| MVP-A19 | 以 stub OpenCode executable 执行远程 Reviewer。 | 参数使用数组并准确形成 `<provider>/<model-id>`；角色、只读权限、provider 配置与模型发现均在调用前验证。 | PLAT-05, MODEL-13, QA-07 |
+| MVP-A20 | 对 D0-D3 Review Packet、敏感字段、预算和独立性组合执行远程门禁。 | 只有计划/授权/隐私/预算/跨家族全部满足时进入替身；D2 未通过真实脱敏标志和 D3 始终拒绝。 | AUTH-09, PRIV-02, PRIV-07, QA-03 |
+| MVP-A21 | 解析有费用、无费用字段和结果未知的 OpenCode 替身响应。 | 已报告费用累计，缺失费用计为 `cost_unavailable`，UNKNOWN 不重试且恢复前必须处置。 | COST-05~06, STATE-03, STATE-05 |
+| MVP-A22 | 运行 canonical Skill 与 installed Skill 校验和哈希比对。 | 两者通过 quick_validate、逐文件内容一致，并保留 plan show → hash approval → authorize → start。 | AUTH-01, AUTH-09, PLAT-02 |
+| MVP-A23 | 用退出码 0 的 OpenCode 事件流分别模拟 implementation 和 review 步骤耗尽。 | 调用为带 `step_limit_reached` 原因的已知失败；implementation 不进入测试/审核，review 不生成 review row，两者保留使用/费用证据并暂停且不自动重试。 | QA-08, STATE-03, STATE-05 |
+| MVP-A24 | 对 Reviewer 返回纯 JSON、fenced JSON、散文包装、缺字段、错类型、非法 severity 与矛盾批准。 | 只有合规 JSON 生成 review row；非合规输出暂停，P0/P1 始终阻断批准。 | QA-06~09 |
+| MVP-A25 | 实施产生计划内未跟踪新文件，包括带空白错误的样例。 | 新文件进入文件范围、Review Packet 和存在性检查；补充检查可在 `git diff --check` 单独退出 0 时捕获未跟踪空白错误。 | GIT-05~06 |
 
 ## 5. MVP 完成定义
 
 同时满足以下条件才算 MVP 通过：
 
-1. MVP-A01 至 MVP-A18 全部通过，且每项有非模型自述的可核查证据。
+1. MVP-A01 至 MVP-A25 全部通过，且每项有非模型自述的可核查证据。
 2. 没有未解决的 P0/P1 审核问题。
 3. 通用核心没有硬编码候选模型或金融规则。
 4. 未包含“明确不做”列表中的能力作为隐含依赖。
@@ -118,7 +139,7 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 
 ## 7. 验收结果
 
-MVP-A01 至 MVP-A18 均已通过。自动化证据由 62 项标准库测试提供，真实适配器另以无敏感数据的临时仓库验证 OpenCode → LM Studio 路径，远程费用为 0。
+MVP-A01 至 MVP-A25 均已通过。当前自动化证据由 98 项标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider 调用或 smoke test，远程费用为 0。历史本地适配器验证保持不变。
 
 | 场景 | 结果 | 主要证据 |
 | --- | --- | --- |
@@ -140,3 +161,10 @@ MVP-A01 至 MVP-A18 均已通过。自动化证据由 62 项标准库测试提�
 | MVP-A16 | 通过 | 未知响应禁止重试、按请求 ID 查询并复用结果测试 |
 | MVP-A17 | 通过 | 状态投影与事件同事务回滚故障注入测试 |
 | MVP-A18 | 通过 | 普通/重要任务审核独立性与等待更强审核测试 |
+| MVP-A19 | 通过 | OpenCode 参数数组、provider/model 发现、角色与只读权限替身测试 |
+| MVP-A20 | 通过 | D0-D3、敏感扫描、预算、授权、跨 family 与 fallback 门禁测试 |
+| MVP-A21 | 通过 | reported cost、`cost_unavailable`、UNKNOWN、恢复与汇总测试 |
+| MVP-A22 | 通过 | canonical/installed `quick_validate` 与逐文件 SHA-256/内容比对 |
+| MVP-A23 | 通过 | 近真实 JSONL fixture、结构化/文本终止标记、implementation/review 暂停及费用/恢复测试 |
+| MVP-A24 | 通过 | JSON-only prompt、严格字段/类型/severity 解析、非合规暂停与 P0/P1 阻断测试 |
+| MVP-A25 | 通过 | 未跟踪文件范围、Review Packet、expected output 与补充空白错误测试 |

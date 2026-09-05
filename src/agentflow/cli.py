@@ -9,12 +9,18 @@ import time
 from pathlib import Path
 
 from .authorization import issue_authorization, validate_authorization
-from .adapters import AdapterRouter
+from .adapters import AdapterRouter, ModelAdapter, UnsupportedProviderError
 from .config import AgentFlowPaths, resolve_paths
-from .contracts import InvocationRequest, InvocationResult, PlanContract, RunMode
+from .contracts import (
+    AuthorizationSnapshot,
+    InvocationRequest,
+    InvocationResult,
+    PlanContract,
+    RunMode,
+)
 from .database import Database
 from .fake_adapter import FakeAdapter
-from .opencode_adapter import OpenCodeAdapter
+from .opencode_adapter import OpenCodeAdapter, RemoteOpenCodeReviewerAdapter
 from .runner import Runner
 from .serialization import canonical_json, load_plan_json, plan_hash
 from .states import ControlState, RunState
@@ -65,20 +71,53 @@ def _confirmation(request: InvocationRequest) -> bool:
     return answer.strip().lower() in {"y", "yes"}
 
 
-def _runner(paths: AgentFlowPaths, database: Database, plan: PlanContract) -> Runner:
-    providers = {
-        model.provider
+def _runner(
+    paths: AgentFlowPaths,
+    database: Database,
+    plan: PlanContract,
+    authorization: AuthorizationSnapshot,
+) -> Runner:
+    models = tuple(
+        model
         for task in plan.tasks
-        for model in (task.implementation_model, task.review_model)
-    }
-    unsupported = providers - {"fake", "lmstudio"}
-    if unsupported:
-        raise ValueError(f"MVP has no adapter for providers: {sorted(unsupported)}")
-    available = {
-        "fake": FakeAdapter(responder=_fake_response),
-        "lmstudio": OpenCodeAdapter(),
-    }
-    adapter = AdapterRouter({provider: available[provider] for provider in providers})
+        for model in (
+            task.implementation_model,
+            task.review_model,
+            task.fallback_model,
+        )
+        if model is not None
+    )
+    providers = {model.provider for model in models}
+    unauthorized = providers - set(authorization.authorized_provider_ids)
+    if unauthorized:
+        raise ValueError(
+            f"provider is outside the authorization: {sorted(unauthorized)}"
+        )
+    for task in plan.tasks:
+        implementation = task.implementation_model
+        if not implementation.is_local and implementation.provider != "fake":
+            raise ValueError(
+                "remote role denied: implementation must use a local adapter"
+            )
+    adapters: dict[str, ModelAdapter] = {}
+    for provider in providers:
+        provider_models = tuple(model for model in models if model.provider == provider)
+        if provider == "fake":
+            adapters[provider] = FakeAdapter(responder=_fake_response)
+        elif provider == "lmstudio":
+            adapters[provider] = OpenCodeAdapter()
+        else:
+            if any(model.is_local for model in provider_models):
+                raise UnsupportedProviderError(
+                    f"unsupported provider: local provider {provider} has no adapter"
+                )
+            remote = RemoteOpenCodeReviewerAdapter(
+                provider, planned_models=provider_models
+            )
+            for model in provider_models:
+                remote.require_model(model)
+            adapters[provider] = remote
+    adapter = AdapterRouter(adapters)
     return Runner(
         database,
         adapter,
@@ -184,7 +223,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             if authorization is None:
                 raise ValueError("plan has no authorization; run `agentflow plan authorize` first")
             validate_authorization(authorization, plan)
-            result = _runner(paths, database, plan).start(
+            result = _runner(paths, database, plan, authorization).start(
                 plan, authorization, run_id=arguments.run_id
             )
             print(canonical_json(result))
@@ -203,6 +242,7 @@ def run_command(arguments: argparse.Namespace) -> int:
                 local = OpenCodeAdapter()
                 for provider_request_id in database.active_provider_requests(arguments.run_id):
                     local.cancel(provider_request_id)
+                database.mark_active_calls_unknown(arguments.run_id)
             else:
                 database.transition_control(arguments.run_id, ControlState.PAUSE_REQUESTED)
             print(canonical_json(database.run_snapshot(arguments.run_id)))
@@ -222,7 +262,7 @@ def run_command(arguments: argparse.Namespace) -> int:
             authorization = database.latest_authorization(plan.plan_id, plan.version)
             if authorization is None:
                 raise ValueError("plan authorization is missing")
-            result = _runner(paths, database, plan).resume(
+            result = _runner(paths, database, plan, authorization).resume(
                 arguments.run_id, plan, authorization
             )
             print(canonical_json(result))
@@ -230,7 +270,10 @@ def run_command(arguments: argparse.Namespace) -> int:
 
         if arguments.command == "resolve-call":
             plan = _load_plan(paths, arguments.file)
-            service = _runner(paths, database, plan).invocations
+            authorization = database.latest_authorization(plan.plan_id, plan.version)
+            if authorization is None:
+                raise ValueError("plan authorization is missing")
+            service = _runner(paths, database, plan, authorization).invocations
             result = service.resolve_unknown(arguments.run_id, arguments.call_id)
             print(
                 canonical_json(
@@ -256,10 +299,16 @@ def run_command(arguments: argparse.Namespace) -> int:
                 time.sleep(1)
 
         if arguments.command == "cost":
-            print(canonical_json({"run_id": arguments.run_id, "usd": database.remote_cost_spent(arguments.run_id)}))
+            summary = database.cost_summary(arguments.run_id)
+            summary["usd"] = summary["confirmed_remote_cost_usd"]
+            print(canonical_json(summary))
             return 0
 
         if arguments.command == "cancel":
+            local = OpenCodeAdapter()
+            for provider_request_id in database.active_provider_requests(arguments.run_id):
+                local.cancel(provider_request_id)
+            database.mark_active_calls_unknown(arguments.run_id)
             database.set_run_state(arguments.run_id, RunState.CANCELLED)
             print(canonical_json(database.run_snapshot(arguments.run_id)))
             return 0

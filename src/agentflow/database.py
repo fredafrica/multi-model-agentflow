@@ -17,8 +17,7 @@ from .contracts import (
     PlanContract,
 )
 from .schema import DDL, SCHEMA_VERSION
-from .serialization import canonical_json, plan_hash
-from .serialization import authorization_from_mapping
+from .serialization import authorization_from_mapping, canonical_json, plan_hash
 from .states import (
     ControlState,
     InvocationState,
@@ -54,6 +53,39 @@ class Database:
 
     def initialize(self) -> None:
         self.connection.executescript(DDL)
+        columns = {
+            row["name"]: row
+            for row in self.connection.execute("PRAGMA table_info(model_calls)")
+        }
+        if columns["remote_cost"]["notnull"]:
+            with self.transaction() as connection:
+                connection.execute(
+                    "ALTER TABLE model_calls RENAME COLUMN remote_cost TO remote_cost_legacy"
+                )
+                connection.execute("ALTER TABLE model_calls ADD COLUMN remote_cost REAL")
+                connection.execute(
+                    "UPDATE model_calls SET remote_cost = remote_cost_legacy"
+                )
+                connection.execute(
+                    "ALTER TABLE model_calls DROP COLUMN remote_cost_legacy"
+                )
+            columns = {
+                row["name"]: row
+                for row in self.connection.execute("PRAGMA table_info(model_calls)")
+            }
+        additions = {
+            "model_family": "TEXT",
+            "is_local": "INTEGER NOT NULL DEFAULT 0 CHECK (is_local IN (0, 1))",
+            "cost_unavailable": (
+                "INTEGER NOT NULL DEFAULT 0 CHECK (cost_unavailable IN (0, 1))"
+            ),
+            "test_double": "INTEGER NOT NULL DEFAULT 0 CHECK (test_double IN (0, 1))",
+        }
+        for name, definition in additions.items():
+            if name not in columns:
+                self.connection.execute(
+                    f"ALTER TABLE model_calls ADD COLUMN {name} {definition}"
+                )
         self.connection.execute(
             "INSERT OR IGNORE INTO schema_meta(version, applied_at) VALUES (?, ?)",
             (SCHEMA_VERSION, utc_now()),
@@ -524,9 +556,10 @@ class Database:
                 """
                 INSERT INTO model_calls(
                     call_id, request_key, attempt_id, provider, model_id, model_version,
-                    role, state, data_sensitivity, read_only, request_scope_json,
-                    remote_cost
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    model_family, is_local, role, state, data_sensitivity, read_only,
+                    request_scope_json, remote_cost, cost_unavailable, test_double,
+                    input_tokens, output_tokens, duration_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, ?, 0, 0, 0)
                 """,
                 (
                     request.call_id,
@@ -535,6 +568,8 @@ class Database:
                     request.model.provider,
                     request.model.model_id,
                     request.model.version,
+                    request.model.family,
+                    int(request.model.is_local),
                     request.role,
                     InvocationState.PLANNED.value,
                     request.data_sensitivity.value,
@@ -543,8 +578,17 @@ class Database:
                         {
                             "allowed_files": request.metadata.get("allowed_files", ()),
                             "test_double": bool(request.metadata.get("test_double", False)),
+                            "packet_hash": request.metadata.get("packet_hash"),
+                            "packet_size": request.metadata.get("packet_size"),
+                            "privacy_policy_version": request.metadata.get(
+                                "privacy_policy_version"
+                            ),
+                            "estimated_remote_cost": request.metadata.get(
+                                "estimated_remote_cost", 0
+                            ),
                         }
                     ),
+                    int(bool(request.metadata.get("test_double", False))),
                 ),
             )
             self._event(
@@ -573,9 +617,19 @@ class Database:
             if target is InvocationState.STARTED:
                 updates += ", started_at = ?"
                 values.append(utc_now())
-            if target in (InvocationState.FAILED, InvocationState.CANCELLED):
-                updates += ", finished_at = ?"
-                values.append(utc_now())
+            if target in (
+                InvocationState.FAILED,
+                InvocationState.CANCELLED,
+                InvocationState.UNKNOWN,
+            ):
+                finished_at = utc_now()
+                updates += (
+                    ", finished_at = ?, duration_ms = CASE "
+                    "WHEN started_at IS NULL THEN 0 "
+                    "ELSE MAX(0, CAST((julianday(?) - julianday(started_at)) "
+                    "* 86400000 AS INTEGER)) END"
+                )
+                values.extend((finished_at, finished_at))
             values.append(call_id)
             connection.execute(f"UPDATE model_calls SET {updates} WHERE call_id = ?", values)
             self._event(
@@ -612,9 +666,10 @@ class Database:
             connection.execute(
                 """
                 UPDATE model_calls SET
-                    state = ?, provider_request_id = ?, input_tokens = ?, output_tokens = ?,
+                    state = ?, provider_request_id = COALESCE(?, provider_request_id),
+                    input_tokens = ?, output_tokens = ?,
                     first_token_latency_ms = ?, duration_ms = ?, remote_cost = ?,
-                    output_text = ?, raw_metadata_json = ?, finished_at = ?
+                    cost_unavailable = ?, output_text = ?, raw_metadata_json = ?, finished_at = ?
                 WHERE call_id = ?
                 """,
                 (
@@ -625,26 +680,95 @@ class Database:
                     result.first_token_latency_ms,
                     result.duration_ms,
                     result.remote_cost,
+                    int(result.cost_unavailable),
                     result.output,
                     canonical_json(result.raw_metadata),
                     utc_now(),
                     call_id,
                 ),
             )
-            connection.execute(
-                """
-                INSERT INTO cost_entries(
-                    cost_entry_id, run_id, call_id, amount, currency, recorded_at
-                ) VALUES (?, ?, ?, ?, 'USD', ?)
-                """,
-                (str(uuid4()), run_id, call_id, result.remote_cost, utc_now()),
-            )
+            if result.remote_cost is not None:
+                connection.execute(
+                    """
+                    INSERT INTO cost_entries(
+                        cost_entry_id, run_id, call_id, amount, currency, recorded_at
+                    ) VALUES (?, ?, ?, ?, 'USD', ?)
+                    """,
+                    (str(uuid4()), run_id, call_id, result.remote_cost, utc_now()),
+                )
             self._event(
                 connection,
                 "call",
                 call_id,
                 "call.completed",
-                {"remote_cost": result.remote_cost},
+                {
+                    "remote_cost": result.remote_cost,
+                    "cost_unavailable": result.cost_unavailable,
+                },
+            )
+
+    def fail_call(
+        self,
+        call_id: str,
+        result: InvocationResult,
+        run_id: str,
+        *,
+        failure_kind: str,
+    ) -> None:
+        """Persist a known failed result without discarding provider usage evidence."""
+        with self.transaction() as connection:
+            row = connection.execute(
+                "SELECT state FROM model_calls WHERE call_id = ?", (call_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(f"unknown call: {call_id}")
+            current = InvocationState(row["state"])
+            require_transition(current, InvocationState.FAILED)
+            metadata = dict(result.raw_metadata)
+            metadata["failure_kind"] = failure_kind
+            connection.execute(
+                """
+                UPDATE model_calls SET
+                    state = ?, provider_request_id = COALESCE(?, provider_request_id),
+                    input_tokens = ?, output_tokens = ?,
+                    first_token_latency_ms = ?, duration_ms = ?, remote_cost = ?,
+                    cost_unavailable = ?, output_text = ?, raw_metadata_json = ?, finished_at = ?
+                WHERE call_id = ?
+                """,
+                (
+                    InvocationState.FAILED.value,
+                    result.provider_request_id,
+                    result.input_tokens,
+                    result.output_tokens,
+                    result.first_token_latency_ms,
+                    result.duration_ms,
+                    result.remote_cost,
+                    int(result.cost_unavailable),
+                    result.output,
+                    canonical_json(metadata),
+                    utc_now(),
+                    call_id,
+                ),
+            )
+            if result.remote_cost is not None:
+                connection.execute(
+                    """
+                    INSERT INTO cost_entries(
+                        cost_entry_id, run_id, call_id, amount, currency, recorded_at
+                    ) VALUES (?, ?, ?, ?, 'USD', ?)
+                    """,
+                    (str(uuid4()), run_id, call_id, result.remote_cost, utc_now()),
+                )
+            self._event(
+                connection,
+                "call",
+                call_id,
+                "call.failed",
+                {
+                    "failure_kind": failure_kind,
+                    "remote_cost": result.remote_cost,
+                    "cost_unavailable": result.cost_unavailable,
+                },
             )
 
     def fetch_one(self, query: str, parameters: tuple[Any, ...] = ()) -> sqlite3.Row | None:
@@ -657,6 +781,60 @@ class Database:
         )
         return float(row["total"])
 
+    def remote_budget_committed(self, run_id: str) -> float:
+        rows = self.connection.execute(
+            """
+            SELECT model_calls.request_scope_json
+            FROM model_calls
+            JOIN attempts USING (attempt_id)
+            WHERE attempts.run_id = ? AND model_calls.is_local = 0
+              AND model_calls.state IN (?, ?) AND model_calls.cost_unavailable = 1
+            """,
+            (
+                run_id,
+                InvocationState.COMPLETED.value,
+                InvocationState.FAILED.value,
+            ),
+        ).fetchall()
+        reserved = sum(
+            float(
+                json.loads(row["request_scope_json"]).get(
+                    "estimated_remote_cost", 0
+                )
+            )
+            for row in rows
+        )
+        return self.remote_cost_spent(run_id) + reserved
+
+    def cost_summary(self, run_id: str) -> dict[str, Any]:
+        rows = self.connection.execute(
+            """
+            SELECT model_calls.provider, model_calls.model_id, model_calls.model_version,
+                   COUNT(*) AS calls,
+                   COALESCE(SUM(model_calls.input_tokens), 0) AS input_tokens,
+                   COALESCE(SUM(model_calls.output_tokens), 0) AS output_tokens,
+                   SUM(CASE WHEN model_calls.cost_unavailable = 1 THEN 1 ELSE 0 END)
+                       AS cost_unavailable_calls,
+                   COALESCE(SUM(cost_entries.amount), 0) AS confirmed_cost
+            FROM model_calls
+            JOIN attempts USING (attempt_id)
+            LEFT JOIN cost_entries USING (call_id)
+            WHERE attempts.run_id = ? AND model_calls.is_local = 0
+            GROUP BY model_calls.provider, model_calls.model_id, model_calls.model_version
+            ORDER BY model_calls.provider, model_calls.model_id, model_calls.model_version
+            """,
+            (run_id,),
+        ).fetchall()
+        providers = [dict(row) for row in rows]
+        return {
+            "run_id": run_id,
+            "confirmed_remote_cost_usd": self.remote_cost_spent(run_id),
+            "cost_unavailable_calls": sum(
+                int(row["cost_unavailable_calls"]) for row in rows
+            ),
+            "by_provider_model": providers,
+        }
+
     def unresolved_unknown_calls(self, run_id: str) -> int:
         row = self.fetch_one(
             """
@@ -667,6 +845,23 @@ class Database:
             (run_id, InvocationState.UNKNOWN.value),
         )
         return int(row["count"])
+
+    def known_incomplete_calls(self, run_id: str) -> int:
+        rows = self.connection.execute(
+            """
+            SELECT model_calls.raw_metadata_json FROM model_calls
+            JOIN attempts USING (attempt_id)
+            WHERE attempts.run_id = ? AND model_calls.state = ?
+            """,
+            (run_id, InvocationState.FAILED.value),
+        ).fetchall()
+        return sum(
+            1
+            for row in rows
+            if row["raw_metadata_json"]
+            and json.loads(row["raw_metadata_json"]).get("failure_kind")
+            == "step_limit_reached"
+        )
 
     def inflight_calls(self, run_id: str) -> int:
         row = self.fetch_one(
@@ -705,6 +900,18 @@ class Database:
             (run_id, InvocationState.STARTED.value),
         ).fetchall()
         return tuple(str(row["provider_request_id"]) for row in rows)
+
+    def mark_active_calls_unknown(self, run_id: str) -> None:
+        rows = self.connection.execute(
+            """
+            SELECT model_calls.call_id FROM model_calls
+            JOIN attempts USING (attempt_id)
+            WHERE attempts.run_id = ? AND model_calls.state = ?
+            """,
+            (run_id, InvocationState.STARTED.value),
+        ).fetchall()
+        for row in rows:
+            self.transition_call(str(row["call_id"]), InvocationState.UNKNOWN)
 
     def latest_authorization(self, plan_id: str, plan_version: int) -> AuthorizationSnapshot | None:
         row = self.fetch_one(

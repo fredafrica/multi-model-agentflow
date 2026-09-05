@@ -2,6 +2,22 @@
 
 ## 2026-09-04
 
+- 启动真实 OpenCode 故障修复；明确本轮不启动子 Agent、不调用真实远程模型、不产生 API 费用、不创建 commit。
+- 已完整读取项目规范、实施计划、需求、MVP、架构决策及 `multi-model-agentflow`、`skill-creator`、`planning-with-files` Skill 指令。
+- 已检查 Git 状态：工作树存在 23 个已修改文件和 1 个未跟踪测试文件，全部视为现有用户改动并在其上工作。
+- 已审阅 OpenCode 本地/远程适配器、Runner、调用服务、调用状态、数据库持久化、Git worktree 证据与相关测试路径。
+- 已根据 OpenCode 官方文档确认 `steps` 是 agentic iteration 上限，最后允许步骤是强制文本收尾；无工具 Reviewer 将采用有语义的有限预算 `2`。
+- 定向测试在沙箱外运行 53 项：52 通过，1 失败。唯一失败为未跟踪空白错误用例沿用了默认重试数，导致额外 revision；已将该用例限定为零重试后继续验证。
+- 修正回归用例后定向测试 53/53 通过；里程碑 10 和 11 完成，进入文档与 Skill 同步。
+- 增加步骤耗尽大小写/标点变体覆盖后，定向测试 54/54 通过；完整测试 98/98 通过。
+- 需求、MVP、架构决策与简洁 Skill 已同步；compileall、canonical Skill 校验和 `git diff --check` 均以退出码 0 通过。
+- 静态审计未发现 `steps=1` 回退或业务项目词汇；测试中的远程适配器均由 mock/stub/FakeAdapter 隔离并保留 `test_double` 标记。
+- 里程碑 12 完成，进入离线 wheel 构建、隔离安装和 installed Skill 同步。
+- wheel 以离线、无构建隔离方式成功生成；SHA-256 为 `3e4061333d96992bba78e730e115ce5da162ebfcf37280df8b475681f7900903`。
+- wheel 在新建临时 Python 3.11 环境中以 `--no-index --no-deps` 成功安装，导入与 CLI 帮助正常，隔离环境完整测试 98/98 通过。
+- installed Skill 已从 canonical 两个文件更新；canonical/installed `SKILL.md` SHA-256 均为 `5366b16b9db0c24cdffeaedddee5ded029656f6c4883d214a1e307eb12041851`，`openai.yaml` 也逐字节一致。
+- installed Skill 官方校验与静态无费用自检通过；里程碑 13 完成，真实远程 Reviewer smoke test 明确保留为后续需重新计划与授权的事项。
+
 - 用户明确授权进入 MVP 实现阶段，并要求每个里程碑完成后反馈。
 - 已完整读取 planning-with-files 与 karpathy-guidelines。
 - 已建立六个里程碑的持续实施计划。

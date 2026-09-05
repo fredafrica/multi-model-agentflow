@@ -1,0 +1,3 @@
+{"type":"step_start","sessionID":"session-step-limit","part":{"type":"step-start"}}
+{"type":"text","sessionID":"session-step-limit","part":{"type":"text","text":"CRITICAL — MAXIMUM STEPS REACHED\n\nThe maximum number of steps for this agent has been reached.\nTools are disabled until the next user input, so I am responding with text only.\n\n## Summary of work accomplished so far\n- Inspected the implementation and its deterministic tests.\n- Recorded the partial work completed before the step limit."}}
+{"type":"step_finish","sessionID":"session-step-limit","part":{"type":"step-finish","reason":"stop","cost":0.125,"tokens":{"input":17,"output":9}}}

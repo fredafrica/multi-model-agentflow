@@ -2,11 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
-from .adapters import AdapterRouter, InvocationOutcomeUnknown, ModelAdapter
+from .adapters import (
+    AdapterRouter,
+    InvocationIncompleteError,
+    InvocationOutcomeUnknown,
+    ModelAdapter,
+)
 from .authorization import validate_authorization
-from .contracts import AuthorizationSnapshot, InvocationRequest, InvocationResult, PlanContract, TaskContract
+from .contracts import (
+    AuthorizationSnapshot,
+    InvocationRequest,
+    InvocationResult,
+    PlanContract,
+    TaskContract,
+)
 from .database import Database
 from .policies import invocation_decision
 from .states import InvocationState
@@ -49,7 +60,7 @@ class InvocationService:
             plan=context.plan,
             authorization=context.authorization,
             estimated_remote_cost=context.estimated_remote_cost,
-            remote_cost_spent=self.database.remote_cost_spent(request.run_id),
+            remote_cost_spent=self.database.remote_budget_committed(request.run_id),
             redaction_passed=context.redaction_passed,
         )
         if not decision.allowed:
@@ -73,13 +84,30 @@ class InvocationService:
                 output_tokens=int(row["output_tokens"] or 0),
                 first_token_latency_ms=row["first_token_latency_ms"],
                 duration_ms=int(row["duration_ms"] or 0),
-                remote_cost=float(row["remote_cost"]),
+                remote_cost=(
+                    float(row["remote_cost"])
+                    if row["remote_cost"] is not None
+                    else None
+                ),
                 raw_metadata={"reused": True},
+                cost_unavailable=bool(row["cost_unavailable"]),
             )
 
         self.database.transition_call(request.call_id, InvocationState.STARTED)
         try:
             result = self.adapter.invoke(request)
+        except InvocationIncompleteError as error:
+            result = error.result
+            if request.model.is_local:
+                result = replace(result, remote_cost=0.0, cost_unavailable=False)
+                error.result = result
+            self.database.fail_call(
+                request.call_id,
+                result,
+                request.run_id,
+                failure_kind=error.failure_kind,
+            )
+            raise
         except InvocationOutcomeUnknown as error:
             if error.provider_request_id:
                 self.database.set_provider_request_id(request.call_id, error.provider_request_id)
@@ -88,6 +116,8 @@ class InvocationService:
         except Exception:
             self.database.transition_call(request.call_id, InvocationState.FAILED)
             raise
+        if request.model.is_local:
+            result = replace(result, remote_cost=0.0, cost_unavailable=False)
         self.database.complete_call(request.call_id, result, request.run_id)
         return result
 

@@ -65,10 +65,15 @@ class GitWorkspace:
     def changed_files(self, worktree: str | Path) -> tuple[str, ...]:
         root = Path(worktree)
         tracked = self._git("diff", "HEAD", "--name-only", "-z", cwd=root).stdout
-        untracked = self._git(
-            "ls-files", "--others", "--exclude-standard", "-z", cwd=root
+        return tuple(
+            sorted(set(filter(None, tracked.split("\0"))) | set(self.untracked_files(root)))
+        )
+
+    def untracked_files(self, worktree: str | Path) -> tuple[str, ...]:
+        output = self._git(
+            "ls-files", "--others", "--exclude-standard", "-z", cwd=Path(worktree)
         ).stdout
-        return tuple(sorted(set(filter(None, (tracked + untracked).split("\0")))))
+        return tuple(sorted(filter(None, output.split("\0"))))
 
     def status_snapshot(self, worktree: str | Path) -> str:
         root = Path(worktree)
@@ -83,16 +88,34 @@ class GitWorkspace:
     def diff(self, worktree: str | Path) -> str:
         root = Path(worktree)
         diff = self._git("diff", "--no-ext-diff", "HEAD", cwd=root).stdout
-        untracked = self._git(
-            "ls-files", "--others", "--exclude-standard", "-z", cwd=root
-        ).stdout.split("\0")
         additions: list[str] = []
-        for relative in filter(None, untracked):
+        for relative in self.untracked_files(root):
             path = root / relative
             if path.is_file():
                 content = path.read_text(encoding="utf-8", errors="replace")[:100_000]
                 additions.append(f"--- /dev/null\n+++ b/{relative}\n{content}")
         return diff + "\n".join(additions)
+
+    def untracked_whitespace_errors(self, worktree: str | Path) -> tuple[str, ...]:
+        """Apply explicit default whitespace checks to untracked text files."""
+        root = Path(worktree)
+        errors: list[str] = []
+        for relative in self.untracked_files(root):
+            path = root / relative
+            if not path.is_file():
+                continue
+            content = path.read_bytes()
+            if b"\0" in content:
+                continue
+            lines = content.splitlines()
+            for line_number, line in enumerate(lines, 1):
+                if line.endswith((b" ", b"\t")):
+                    errors.append(f"{relative}:{line_number}: trailing whitespace")
+                if re.match(rb"^ +\t", line):
+                    errors.append(f"{relative}:{line_number}: space before tab in indent")
+            if lines and lines[-1].strip() == b"":
+                errors.append(f"{relative}:{len(lines)}: new blank line at EOF")
+        return tuple(errors)
 
     def run_test(
         self, worktree: str | Path, command: tuple[str, ...], timeout_seconds: int = 120

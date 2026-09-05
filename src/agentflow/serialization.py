@@ -105,6 +105,10 @@ def plan_from_mapping(data: Mapping[str, Any]) -> PlanContract:
         allowed_model_keys=tuple(str(item) for item in data.get("allowed_model_keys", ())),
         blocked_model_keys=tuple(str(item) for item in data.get("blocked_model_keys", ())),
         critical_task_ids=tuple(str(item) for item in data.get("critical_task_ids", ())),
+        allowed_provider_ids=tuple(
+            str(item) for item in data.get("allowed_provider_ids", ())
+        ),
+        authorization_ttl_seconds=int(data.get("authorization_ttl_seconds", 86_400)),
     )
 
 
@@ -125,10 +129,18 @@ def authorization_from_mapping(data: Mapping[str, Any]) -> AuthorizationSnapshot
         expires_at=datetime.fromisoformat(data["expires_at"]),
         authorized_task_ids=tuple(str(item) for item in data["authorized_task_ids"]),
         authorized_model_keys=tuple(str(item) for item in data["authorized_model_keys"]),
+        authorized_provider_ids=tuple(
+            str(item)
+            for item in data.get(
+                "authorized_provider_ids",
+                sorted({str(key).split(":", 1)[0] for key in data["authorized_model_keys"]}),
+            )
+        ),
         allowed_files=tuple(str(item) for item in data["allowed_files"]),
         max_remote_cost=float(data["max_remote_cost"]),
         run_mode=RunMode(data["run_mode"]),
         data_policy=dict(data["data_policy"]),
+        privacy_policy_version=str(data.get("privacy_policy_version", "unknown")),
         max_retry_count=int(data["max_retry_count"]),
         stop_conditions=tuple(str(item) for item in data["stop_conditions"]),
         escalation_conditions=tuple(str(item) for item in data["escalation_conditions"]),

@@ -16,6 +16,41 @@ class InvocationOutcomeUnknown(RuntimeError):
         self.provider_request_id = provider_request_id
 
 
+class InvocationIncompleteError(RuntimeError):
+    """The provider returned a known, non-success terminal result with usage evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        result: InvocationResult,
+        *,
+        failure_kind: str,
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+        self.failure_kind = failure_kind
+
+
+class ReviewerUnavailableError(RuntimeError):
+    """A planned reviewer cannot be selected without sending a model request."""
+
+
+class UnsupportedProviderError(ReviewerUnavailableError):
+    pass
+
+
+class ProviderNotConfiguredError(ReviewerUnavailableError):
+    pass
+
+
+class ModelUnavailableError(ReviewerUnavailableError):
+    pass
+
+
+class ReviewerProtocolError(ReviewerUnavailableError):
+    """The reviewer answered, but its output did not satisfy the review protocol."""
+
+
 class ModelAdapter(Protocol):
     @property
     def adapter_id(self) -> str: ...

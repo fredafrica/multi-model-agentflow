@@ -180,6 +180,31 @@
 - 状态：已接受
 - 决策：macOS 通知不属于 MVP 验收条件，在核心闭环完成后再作为增强实现；只通知完成、失败、需要授权和暂停超时。
 
+### AD-34：OpenCode 远程只读 Reviewer
+
+- 状态：已接受（Owner 于 2026-09-04 明确授权）
+- 决策：在保持模型无关核心的前提下，AgentFlow 可以通过 OpenCode 调用计划和授权快照指定的远程 provider/model；第一版远程角色仅限 `review`/`rereview`。本地主模型继续负责 implementation/revision，Codex 继续担任 Supervisor。
+- 安全边界：远程 Reviewer 强制只读、无仓库工作区、无编辑/Shell/外部目录/网页/任务/子 Agent/Skill/交互工具，只接收经过隐私与预算门禁的最小 Review Packet。重要或关键任务必须与实施模型跨 family；不可用时停在 `waiting_review`，不得降级为自审。
+- 发现与费用：OpenCode 无推理模型列表只产生 configured/discoverable 或 callable_unverified 证据，不能产生 callable_verified；真实 smoke test 需要独立计划与哈希批准。远程费用使用 provider 报告值，缺失时记录 `cost_unavailable`，不伪造零。
+- 影响：本决定仅覆盖 AD-20 和原 MVP “不实现远程真实适配器”的范围限制，不放宽既有授权、D0-D3、预算、UNKNOWN、幂等、费用、文件或副作用规则，也不授权本次开发任务进行真实模型调用。
+
+### AD-35：已知不完整调用的终态
+
+- 状态：已接受（Owner 于 2026-09-04 明确要求）
+- 决策：步骤上限耗尽等已确认不完整结果使用现有非成功 `failed` 调用终态，并在原始元数据中保存稳定 `failure_kind`；它不是 `completed`，也不是结果不确定的 `UNKNOWN`。适配器优先检查结构化终止事件，无专用字段时才保守匹配最终文本的规范标记。
+- 影响：失败记录保留已确认 Token、耗时、费用和部分输出，Runner 在 implementation/review 各自边界使用不同暂停原因，恢复不得猜测性重试可能产生费用的调用。
+
+### AD-36：Reviewer 严格 JSON-only 协议
+
+- 状态：已接受（Owner 于 2026-09-04 明确要求）
+- 决策：Reviewer prompt 在最小 Review Packet 之外声明唯一输出协议，核心只接受单一 JSON 对象并严格验证 `approved`、`findings`、P0-P3 与 finding 字段类型。不从 Markdown fence 或散文中提取结论，P0/P1 总是阻断批准。
+- 影响：非合规回答使运行停在 review 边界并记录 `reviewer_output_invalid`，不生成正式 review row。
+
+### AD-37：未跟踪输出的补充证据
+
+- 状态：已接受（Owner 于 2026-09-04 明确要求）
+- 决策：文件范围和 Reviewer diff 合并 tracked diff 与未跟踪文件，expected output 另行检查存在性。因 `git diff --check` 单独不完整覆盖未跟踪内容，AgentFlow 对未跟踪文本附加明确空白错误检查并单独记录证据。
+
 ## 2. 原暂定、经实现验证后接受的决策
 
 ### AD-17：实现技术基线
@@ -196,7 +221,7 @@
 
 ## 3. 冲突检查与解释
 
-目前没有发现不可调和的需求矛盾。以下表面张力已按保守方式解释并由 MVP 测试验证：
+目前没有发现不可调和的需求矛盾。AD-34 是 Owner 对 AD-20 范围的明确后续扩展，不视为隐式冲突。以下表面张力按保守方式解释：
 
 | 表面张力 | 一致解释 | 状态 |
 | --- | --- | --- |
@@ -207,6 +232,7 @@
 | SQLite 当前状态与追加式事件日志同时存在 | 事件表和状态投影由单个 SQLite 事务更新，JSONL 只是可再生成导出。 | 已由 AD-24 固化 |
 | 平台无关与首发 macOS | 核心合同、存储与适配器跨平台；macOS 通知等能力隔离为可选增强。 | 已由 PLAT-03 固化 |
 | 任务卡只有 `risk_level` 字段与双维风险模型 | `risk_level` 以对象形式保存独立的 `business_importance` 与 `operational_safety`。 | 已由 AD-25 固化 |
+| AD-20 推迟远程适配器与新增远程 Reviewer | AD-34 仅覆盖经 OpenCode、计划限定、只读的 review/rereview；其他远程直连和真实 smoke test 仍不在本次范围。 | 已由最新 Owner 决策固化 |
 
 ## 4. 待确认事项
 

@@ -1,6 +1,6 @@
 """Versioned SQLite schema for the AgentFlow MVP."""
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 DDL = """
 PRAGMA foreign_keys = ON;
@@ -80,6 +80,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
     provider TEXT NOT NULL,
     model_id TEXT NOT NULL,
     model_version TEXT NOT NULL,
+    model_family TEXT,
+    is_local INTEGER NOT NULL CHECK (is_local IN (0, 1)),
     role TEXT NOT NULL,
     state TEXT NOT NULL,
     data_sensitivity TEXT NOT NULL,
@@ -92,7 +94,9 @@ CREATE TABLE IF NOT EXISTS model_calls (
     output_tokens INTEGER,
     first_token_latency_ms INTEGER,
     duration_ms INTEGER,
-    remote_cost REAL NOT NULL DEFAULT 0,
+    remote_cost REAL,
+    cost_unavailable INTEGER NOT NULL DEFAULT 0 CHECK (cost_unavailable IN (0, 1)),
+    test_double INTEGER NOT NULL DEFAULT 0 CHECK (test_double IN (0, 1)),
     started_at TEXT,
     finished_at TEXT,
     FOREIGN KEY (attempt_id) REFERENCES attempts(attempt_id)

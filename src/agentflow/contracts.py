@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
@@ -60,6 +61,15 @@ class TrustLevel(StringEnum):
     RESTRICTED = "restricted"
 
 
+class ModelAvailabilityState(StringEnum):
+    UNSUPPORTED = "unsupported"
+    NOT_CONFIGURED = "not_configured"
+    DISCOVERABLE = "discoverable"
+    UNAVAILABLE = "unavailable"
+    CALLABLE_UNVERIFIED = "callable_unverified"
+    CALLABLE_VERIFIED = "callable_verified"
+
+
 class Severity(StringEnum):
     P0 = "P0"
     P1 = "P1"
@@ -80,6 +90,12 @@ class ModelRef:
     version: str
     family: str | None = None
     is_local: bool = False
+
+    def __post_init__(self) -> None:
+        validate_provider_id(self.provider)
+        validate_model_id(self.model_id)
+        if not self.version:
+            raise ValueError("model version is required")
 
     @property
     def registry_key(self) -> str:
@@ -105,6 +121,7 @@ class ModelRecord:
     first_pass_rate: float | None = None
     average_rework_count: float | None = None
     independently_reviewed_tasks: int = 0
+    availability_state: ModelAvailabilityState = ModelAvailabilityState.UNAVAILABLE
 
 
 @dataclass(frozen=True)
@@ -159,6 +176,8 @@ class PlanContract:
     allowed_model_keys: tuple[str, ...] = ()
     blocked_model_keys: tuple[str, ...] = ()
     critical_task_ids: tuple[str, ...] = ()
+    allowed_provider_ids: tuple[str, ...] = ()
+    authorization_ttl_seconds: int = 86_400
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", int(self.schema_version))
@@ -166,12 +185,15 @@ class PlanContract:
         object.__setattr__(self, "max_remote_cost", float(self.max_remote_cost))
         object.__setattr__(self, "emergency_reserve", float(self.emergency_reserve))
         object.__setattr__(self, "max_concurrency", int(self.max_concurrency))
+        object.__setattr__(self, "authorization_ttl_seconds", int(self.authorization_ttl_seconds))
         if self.schema_version < 1 or self.version < 1:
             raise ValueError("schema_version and version must be positive")
         if self.max_remote_cost < 0 or self.emergency_reserve < 0:
             raise ValueError("plan budgets cannot be negative")
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
+        if self.authorization_ttl_seconds < 1:
+            raise ValueError("authorization_ttl_seconds must be positive")
         if not 1 <= len(self.tasks) <= 4:
             raise ValueError("an MVP plan must contain one to four tasks")
         task_ids = [task.task_id for task in self.tasks]
@@ -201,9 +223,40 @@ class PlanContract:
             raise ValueError("a task model is blocked by the plan")
         if set(self.allowed_model_keys) & set(self.blocked_model_keys):
             raise ValueError("the model allowlist and blocklist must not overlap")
+        listed_providers = {
+            model.provider
+            for task in self.tasks
+            for model in (
+                task.implementation_model,
+                task.review_model,
+                task.fallback_model,
+            )
+            if model is not None
+        }
+        for provider in self.allowed_provider_ids:
+            validate_provider_id(provider)
+        if self.allowed_provider_ids and not listed_providers <= set(self.allowed_provider_ids):
+            raise ValueError("task providers must be in the plan provider allowlist")
         unknown_critical = set(self.critical_task_ids) - set(task_ids)
         if unknown_critical:
             raise ValueError(f"unknown critical task IDs: {unknown_critical}")
+
+    @property
+    def provider_ids(self) -> tuple[str, ...]:
+        return tuple(
+            sorted(
+                {
+                    model.provider
+                    for task in self.tasks
+                    for model in (
+                        task.implementation_model,
+                        task.review_model,
+                        task.fallback_model,
+                    )
+                    if model is not None
+                }
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -216,10 +269,12 @@ class AuthorizationSnapshot:
     expires_at: datetime
     authorized_task_ids: tuple[str, ...]
     authorized_model_keys: tuple[str, ...]
+    authorized_provider_ids: tuple[str, ...]
     allowed_files: tuple[str, ...]
     max_remote_cost: float
     run_mode: RunMode
     data_policy: Mapping[str, Any]
+    privacy_policy_version: str
     max_retry_count: int
     stop_conditions: tuple[str, ...]
     escalation_conditions: tuple[str, ...]
@@ -247,16 +302,35 @@ class InvocationResult:
     output_tokens: int
     first_token_latency_ms: int | None
     duration_ms: int
-    remote_cost: float
+    remote_cost: float | None
     raw_metadata: Mapping[str, Any] = field(default_factory=dict)
+    cost_unavailable: bool = False
+
+    def __post_init__(self) -> None:
+        if self.remote_cost is not None and self.remote_cost < 0:
+            raise ValueError("reported cost cannot be negative")
+        if self.remote_cost is not None and self.cost_unavailable:
+            raise ValueError("reported cost cannot also be unavailable")
+        if self.remote_cost is None and not self.cost_unavailable:
+            object.__setattr__(self, "cost_unavailable", True)
 
 
 @dataclass(frozen=True)
 class ReviewFinding:
     severity: Severity
-    summary: str
-    evidence: str
+    title: str
+    explanation: str
     blocking: bool
+    path: str | None = None
+    remediation: str | None = None
+
+    @property
+    def summary(self) -> str:
+        return self.title
+
+    @property
+    def evidence(self) -> str:
+        return self.explanation
 
 
 @dataclass(frozen=True)
@@ -271,3 +345,19 @@ class ReviewResult:
         blocking = any(item.severity in (Severity.P0, Severity.P1) for item in self.findings)
         if self.approved and blocking:
             raise ValueError("P0/P1 findings prevent approval")
+
+
+_PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,255}$")
+
+
+def validate_provider_id(value: str) -> str:
+    if not _PROVIDER_ID.fullmatch(value):
+        raise ValueError(f"unsupported provider identifier: {value!r}")
+    return value
+
+
+def validate_model_id(value: str) -> str:
+    if not _MODEL_ID.fullmatch(value):
+        raise ValueError(f"unsupported model identifier: {value!r}")
+    return value

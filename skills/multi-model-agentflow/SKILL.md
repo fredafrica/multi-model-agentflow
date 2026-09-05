@@ -27,7 +27,10 @@ Any plan, model, file, budget, remote-data, permission, or side-effect expansion
 - Discover local availability with AgentFlow/OpenCode/LM Studio status; treat installed-but-unloaded or unverified models as unavailable for immediate routing.
 - Treat model names and versions as registry data, never permanent defaults.
 - Do not download or load models, install runtimes, create provider accounts, buy credit, obtain keys, or change provider configuration unless the user separately requests that action.
-- D3 never goes to a remote model. D2 requires both plan-specific approval and a passed redaction check.
+- AgentFlow may use OpenCode for a plan-selected remote reviewer, but only for `review`/`rereview`. The reviewer must be independently selected, read-only, budget-limited, and unable to edit, use shells, browse the web, invoke skills, or start subagents.
+- Apply D0-D3 to the minimal Review Packet. D1 requires plan-specific remote approval; D2 requires both plan-specific approval and a real passed redaction check; D3 never goes remote.
+- OpenCode configured/discoverable status is not proof that a model is callable. A real smoke test requires its own plan, displayed hash, explicit approval, and authorization.
+- Treat a recorded step-limit or incomplete invocation as a known failed call, not completion or `UNKNOWN`. Stop at its saved boundary and do not resume or retry it speculatively; preserve recorded usage and cost evidence.
 - Important or critical tasks require a review model from a different family. If none is available, stop at `waiting_review`; never represent the task as approved.
 
 ## Operating modes
@@ -62,4 +65,4 @@ After human edits, let AgentFlow compare worktree content and invalidate only af
 
 ## Completion
 
-Report completion only when deterministic tests pass, the independent read-only review has no P0/P1 findings, the recorded worktree changes stay within allowed files, and AgentFlow reports the task approved. Clearly label fake-adapter evidence and never present it as a real model review.
+Report completion only when deterministic tests pass, the independent read-only review returned one protocol-valid JSON object with no P0/P1 findings, the recorded worktree changes stay within allowed files, and AgentFlow reports the task approved. Non-JSON review prose, fenced JSON, or an incomplete call cannot approve a task. Clearly label fake-adapter evidence and never present it as a real model review.

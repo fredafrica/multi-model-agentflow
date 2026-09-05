@@ -29,12 +29,22 @@ class PolicyDecision:
 
 _SECRET_PATTERNS = {
     "credential_field": re.compile(
-        r"(?i)(api[_-]?key|access[_-]?token|password|secret)\s*[:=]\s*\S+"
+        r'''(?ix)
+        ["']?
+        (?:api[_-]?key|access[_-]?token|auth[_-]?token|token|password|secret|credential)
+        ["']?\s*[:=]\s*["']?[^\s,"']+
+        '''
     ),
     "bearer_token": re.compile(r"(?i)\bbearer\s+[a-z0-9._~+/=-]{12,}"),
-    "personal_path": re.compile(r"(?:/Users/[^/\s]+|[A-Za-z]:\\Users\\[^\\\s]+)"),
+    "personal_path": re.compile(
+        r"(?:/Users/[^/\s]+|/home/[^/\s]+|[A-Za-z]:\\Users\\[^\\\s]+)"
+    ),
     "account_field": re.compile(
-        r"(?i)(account[_-]?id|account[_-]?number|routing[_-]?number)\s*[:=]\s*\S+"
+        r'''(?ix)
+        ["']?
+        (?:account|account[_-]?id|account[_-]?number|routing[_-]?number|username)
+        ["']?\s*[:=]\s*["']?[^\s,"']+
+        '''
     ),
 }
 
@@ -81,25 +91,44 @@ def invocation_decision(
         reasons.append("task is outside the authorization")
     if request.model.registry_key not in authorization.authorized_model_keys:
         reasons.append("model is outside the authorization")
+    if request.model.provider not in authorization.authorized_provider_ids:
+        reasons.append("provider is outside the authorization")
+    if request.model.provider not in plan.provider_ids:
+        reasons.append("provider is outside the plan")
+    expected_models = (
+        (task.implementation_model, task.fallback_model)
+        if request.role in ("implementation", "revision")
+        else (task.review_model, task.fallback_model)
+        if request.role in ("review", "rereview")
+        else ()
+    )
+    if request.model not in expected_models:
+        reasons.append("model is not authorized for this task role")
     if request.model.registry_key in plan.blocked_model_keys:
         reasons.append("model is blocked by the plan")
     if plan.allowed_model_keys and request.model.registry_key not in plan.allowed_model_keys:
         reasons.append("model is outside the plan allowlist")
     if estimated_remote_cost < 0:
         reasons.append("estimated cost cannot be negative")
+    if request.data_sensitivity is not task.data_sensitivity:
+        reasons.append("privacy denied: request sensitivity differs from task contract")
     if not request.model.is_local:
+        if request.role not in ("review", "rereview"):
+            reasons.append("remote role denied: only review and rereview are allowed")
+        if not request.read_only:
+            reasons.append("remote role denied: reviewer must be read-only")
         if plan.budget_mode is BudgetMode.LOCAL_FREE:
-            reasons.append("local-free mode prohibits remote models")
+            reasons.append("budget denied: local-free mode prohibits remote models")
         usable_budget = max(0.0, authorization.max_remote_cost - plan.emergency_reserve)
         if remote_cost_spent + estimated_remote_cost > usable_budget:
-            reasons.append("remote cost would exceed the usable budget")
+            reasons.append("budget denied: remote cost would exceed the usable budget")
         privacy = remote_data_decision(
             request.data_sensitivity,
             authorization=authorization,
             redaction_passed=redaction_passed,
             content=request.prompt,
         )
-        reasons.extend(privacy.reasons)
+        reasons.extend(f"privacy denied: {reason}" for reason in privacy.reasons)
     confirmation = plan.run_mode is RunMode.SUPERVISED
     if plan.run_mode is RunMode.ADAPTIVE:
         confirmation = (
@@ -123,8 +152,17 @@ def review_independence_decision(task: TaskContract) -> PolicyDecision:
     if task.risk_level.business_importance in (
         BusinessImportance.IMPORTANT,
         BusinessImportance.CRITICAL,
-    ) and implementation.family_key == reviewer.family_key:
-        return PolicyDecision(False, ("important tasks require a different model family",))
+    ):
+        if not implementation.family or not reviewer.family:
+            return PolicyDecision(
+                False,
+                ("important tasks require explicit model family metadata",),
+            )
+        if implementation.family_key == reviewer.family_key:
+            return PolicyDecision(
+                False,
+                ("important tasks require a different model family",),
+            )
     return PolicyDecision(True)
 
 

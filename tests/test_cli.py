@@ -8,6 +8,7 @@ import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 from agentflow.cli import main
 from agentflow.contracts import (
@@ -20,8 +21,11 @@ from agentflow.contracts import (
     RiskLevel,
     RunMode,
     TaskContract,
+    InvocationRequest,
 )
+from agentflow.database import Database
 from agentflow.serialization import canonical_json, plan_hash
+from agentflow.states import InvocationState, TaskState
 
 
 def git(root: Path, *args: str) -> None:
@@ -154,6 +158,81 @@ class CliTests(unittest.TestCase):
         self.assertTrue(call[3])
         self.assertEqual(1, tests)
         self.assertEqual(1, reviews)
+
+    def test_immediate_pause_and_cancel_terminate_active_opencode_group(self) -> None:
+        for action, expected_run_state in (
+            ("cancel", "cancelled"),
+            ("pause", "paused"),
+        ):
+            with self.subTest(action=action):
+                code, _, error = self.call(
+                    "plan", "authorize", "--hash", plan_hash(self.plan)
+                )
+                self.assertEqual(0, code, error)
+                run_id = f"{action}-run"
+                attempt_id = f"{action}-attempt"
+                call_id = f"{action}-call"
+                process_id = 4242 if action == "pause" else 4243
+                process_reference = f"local-process-group:{process_id}"
+                database = Database(
+                    self.root / ".agentflow" / "runs" / "agentflow.db"
+                )
+                database.initialize()
+                try:
+                    authorization = database.latest_authorization(
+                        self.plan.plan_id, self.plan.version
+                    )
+                    database.create_run(run_id, self.plan, authorization)
+                    database.transition_task(
+                        run_id, "no-op", TaskState.WAITING_AUTHORIZATION
+                    )
+                    database.transition_task(run_id, "no-op", TaskState.QUEUED)
+                    database.transition_task(run_id, "no-op", TaskState.RUNNING)
+                    database.create_attempt(attempt_id, run_id, "no-op", 1)
+                    request = InvocationRequest(
+                        call_id=call_id,
+                        request_key=f"{action}-request",
+                        run_id=run_id,
+                        task_id="no-op",
+                        role="implementation",
+                        model=ModelRef(
+                            "lmstudio", "local-model", "1", "local", True
+                        ),
+                        prompt="test",
+                        data_sensitivity=DataSensitivity.PUBLIC,
+                        read_only=False,
+                    )
+                    database.register_call(request, attempt_id)
+                    database.transition_call(call_id, InvocationState.STARTED)
+                    database.set_provider_request_id(call_id, process_reference)
+                finally:
+                    database.close()
+                with mock.patch(
+                    "agentflow.cli.OpenCodeAdapter.cancel", return_value=True
+                ) as cancel:
+                    arguments = (
+                        ("pause", run_id, "--immediate")
+                        if action == "pause"
+                        else ("cancel", run_id)
+                    )
+                    code, output, error = self.call(*arguments)
+                self.assertEqual(0, code, error)
+                cancel.assert_called_once_with(process_reference)
+                self.assertEqual(
+                    expected_run_state,
+                    json.loads(output)["run"]["run_state"],
+                )
+                connection = sqlite3.connect(
+                    self.root / ".agentflow" / "runs" / "agentflow.db"
+                )
+                try:
+                    state = connection.execute(
+                        "SELECT state FROM model_calls WHERE call_id = ?",
+                        (call_id,),
+                    ).fetchone()[0]
+                finally:
+                    connection.close()
+                self.assertEqual("unknown", state)
 
 
 if __name__ == "__main__":

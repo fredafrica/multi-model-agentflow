@@ -9,9 +9,6 @@ from .contracts import AuthorizationSnapshot, PlanContract
 from .serialization import plan_hash
 
 
-DEFAULT_AUTHORIZATION_LIFETIME = timedelta(hours=24)
-
-
 def issue_authorization(
     plan: PlanContract,
     *,
@@ -41,9 +38,10 @@ def issue_authorization(
         plan_version=plan.version,
         plan_hash=plan_hash(plan),
         authorized_at=issued_at,
-        expires_at=issued_at + DEFAULT_AUTHORIZATION_LIFETIME,
+        expires_at=issued_at + timedelta(seconds=plan.authorization_ttl_seconds),
         authorized_task_ids=tuple(task.task_id for task in plan.tasks),
         authorized_model_keys=models,
+        authorized_provider_ids=plan.provider_ids,
         allowed_files=files,
         max_remote_cost=plan.max_remote_cost,
         run_mode=plan.run_mode,
@@ -51,6 +49,7 @@ def issue_authorization(
             "allow_d1_remote": allow_d1_remote,
             "allow_d2_remote": allow_d2_remote,
         },
+        privacy_policy_version=plan.privacy_policy_version,
         max_retry_count=max((task.max_retry_count for task in plan.tasks), default=0),
         stop_conditions=("authorization_expired", "budget_exhausted", "policy_violation"),
         escalation_conditions=tuple(
@@ -76,3 +75,7 @@ def validate_authorization(
         raise ValueError("plan content changed after authorization")
     if authorization.run_mode != plan.run_mode:
         raise ValueError("run mode changed after authorization")
+    if set(authorization.authorized_provider_ids) != set(plan.provider_ids):
+        raise ValueError("provider scope changed after authorization")
+    if authorization.privacy_policy_version != plan.privacy_policy_version:
+        raise ValueError("privacy policy changed after authorization")

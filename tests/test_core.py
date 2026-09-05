@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -32,6 +33,7 @@ from agentflow.policies import (
     review_independence_decision,
 )
 from agentflow.serialization import canonical_json, plan_hash
+from agentflow.schema import DDL
 from agentflow.service import (
     ConfirmationRequiredError,
     InvocationContext,
@@ -108,6 +110,14 @@ class SerializationTests(unittest.TestCase):
         self.assertEqual(plan_hash(plan), plan_hash(plan))
         changed = replace(plan, version=2)
         self.assertNotEqual(plan_hash(plan), plan_hash(changed))
+        self.assertNotEqual(
+            plan_hash(plan),
+            plan_hash(replace(plan, allowed_provider_ids=plan.provider_ids)),
+        )
+        self.assertNotEqual(
+            plan_hash(plan),
+            plan_hash(replace(plan, authorization_ttl_seconds=60)),
+        )
         self.assertEqual(canonical_json(plan), canonical_json(plan))
 
 
@@ -121,6 +131,23 @@ class AuthorizationTests(unittest.TestCase):
             validate_authorization(authorization, replace(plan, version=2), now=now)
         with self.assertRaises(ValueError):
             validate_authorization(authorization, plan, now=now + timedelta(hours=24))
+
+    def test_authorization_binds_provider_privacy_policy_and_plan_ttl(self) -> None:
+        now = datetime(2026, 9, 4, tzinfo=timezone.utc)
+        plan = replace(
+            make_plan(),
+            allowed_provider_ids=("local",),
+            authorization_ttl_seconds=60,
+        )
+        authorization = issue_authorization(plan, now=now)
+        self.assertEqual(("local",), authorization.authorized_provider_ids)
+        self.assertEqual(now + timedelta(seconds=60), authorization.expires_at)
+        with self.assertRaisesRegex(ValueError, "privacy policy"):
+            validate_authorization(
+                replace(authorization, privacy_policy_version="changed"),
+                plan,
+                now=now,
+            )
 
 
 class ConfigTests(unittest.TestCase):
@@ -213,6 +240,23 @@ class PolicyTests(unittest.TestCase):
         self.assertFalse(decision.allowed)
         self.assertEqual(2, len(decision.reasons))
 
+    def test_json_credentials_generic_tokens_accounts_and_home_paths_are_blocked(self) -> None:
+        authorization = issue_authorization(make_plan())
+        for content in (
+            '{"token":"abc123"}',
+            '{"username":"example-user"}',
+            "/home/example/project",
+        ):
+            with self.subTest(content=content):
+                self.assertFalse(
+                    remote_data_decision(
+                        DataSensitivity.PUBLIC,
+                        authorization=authorization,
+                        redaction_passed=False,
+                        content=content,
+                    ).allowed
+                )
+
     def test_modes_have_deterministic_confirmation_points(self) -> None:
         for mode, expected in (
             (RunMode.MANAGED, False),
@@ -277,7 +321,10 @@ class PolicyTests(unittest.TestCase):
             remote_cost_spent=0.5,
         )
         self.assertFalse(decision.allowed)
-        self.assertIn("remote cost would exceed the usable budget", decision.reasons)
+        self.assertIn(
+            "budget denied: remote cost would exceed the usable budget",
+            decision.reasons,
+        )
 
     def test_adaptive_critical_task_requires_confirmation(self) -> None:
         task = make_task()
@@ -362,6 +409,15 @@ class DatabaseTests(unittest.TestCase):
         self.database.register_call(request, "attempt-1")
         self.database.transition_call(request.call_id, InvocationState.STARTED)
         self.database.transition_call(request.call_id, InvocationState.UNKNOWN)
+        row = self.database.fetch_one(
+            "SELECT input_tokens, output_tokens, duration_ms, started_at, finished_at "
+            "FROM model_calls WHERE call_id = ?",
+            (request.call_id,),
+        )
+        self.assertEqual((0, 0), (row["input_tokens"], row["output_tokens"]))
+        self.assertIsNotNone(row["duration_ms"])
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNotNone(row["finished_at"])
         with self.assertRaises(UnknownInvocationError):
             self.database.register_call(request, "attempt-1")
 
@@ -398,6 +454,26 @@ class DatabaseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.database.create_run("run-2", self.plan, self.authorization)
 
+    def test_v1_nonnullable_cost_column_migrates_to_nullable(self) -> None:
+        legacy_path = Path(self.temp.name) / "legacy.db"
+        connection = sqlite3.connect(legacy_path)
+        try:
+            connection.executescript(
+                DDL.replace("remote_cost REAL,", "remote_cost REAL NOT NULL DEFAULT 0,")
+            )
+        finally:
+            connection.close()
+        legacy = Database(legacy_path)
+        try:
+            legacy.initialize()
+            columns = {
+                row["name"]: row
+                for row in legacy.connection.execute("PRAGMA table_info(model_calls)")
+            }
+            self.assertEqual(0, columns["remote_cost"]["notnull"])
+        finally:
+            legacy.close()
+
 
 class InvocationServiceTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -430,6 +506,22 @@ class InvocationServiceTests(unittest.TestCase):
         )
         self.assertEqual(0, result.remote_cost)
         self.assertEqual(1, len(service.adapter.invocations))
+
+    def test_local_adapter_reported_cost_is_normalized_to_zero(self) -> None:
+        request = request_for(self.task, "local-cost-normalized")
+        adapter = FakeAdapter(
+            responder=lambda _request: InvocationResult(
+                "local-provider", "ok", 1, 1, 0, 1, 2.5
+            )
+        )
+        result = InvocationService(self.database, adapter).invoke(
+            request,
+            InvocationContext(
+                self.plan, self.task, self.authorization, "attempt-1"
+            ),
+        )
+        self.assertEqual(0, result.remote_cost)
+        self.assertFalse(result.cost_unavailable)
 
     def test_supervised_mode_requires_confirmation_before_adapter(self) -> None:
         task = self.task

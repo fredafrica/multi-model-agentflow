@@ -9,6 +9,7 @@ from .contracts import InvocationRequest, InvocationResult, ModelRecord
 
 class FakeAdapter:
     adapter_id = "fake"
+    test_double = True
 
     def __init__(
         self,
