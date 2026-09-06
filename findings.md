@@ -105,3 +105,9 @@
 - 疑似路径必须与裸标记共用语法，否则 `The maximum number ...` 和 CRITICAL 变体带未知后缀时仍会被静默判完成。
 - 标记主体后必须校验词边界；紧跟字母、数字或下划线不是标记，而句点等标点已构成后缀边界，即使其后没有空格也应安全降级为 `suspected_step_limit`。
 - 对于无法自动认证的未知后缀，安全性优先于吞吐量：不自动 continuation、不误报 completed，且 resume 前置阻断确保不重复调用模型。
+
+## TASK-011 真实重跑模型门禁
+
+- LM Studio CLI 对 `qwen/qwen3.8-27b@8bit` 和 `lmstudio-community/Qwen3.8-27B-MLX-8bit` 的直接加载名称均返回“Model not found”；这不是模型缺失，也没有触发其他模型回退。
+- 使用本地已安装模型键 `qwen/qwen3.8-27b` 加载并固定同名 identifier 后，`lms ps --json` 显示实际 `selectedVariant=qwen/qwen3.8-27b@8bit`、`quantization.bits=8`、`format=safetensors`。
+- 门禁判据以 `lms ps` 的实际驻留状态为准，而非 `/v1/models` 的已安装模型清单；启动时仅一个 Qwen LLM 驻留，满足串行模型驻留约束。

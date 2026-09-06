@@ -2,6 +2,8 @@
 
 ## 2026-09-05
 
+- TASK-011 真实重跑模型门禁已通过：`lms ps --json` 仅有 `qwen/qwen3.8-27b`，实际变体 `qwen/qwen3.8-27b@8bit`、量化 `bits=8`、上下文 262144；未加载 GPT-OSS 或其他 LLM。
+- 两次按变体/仓库路径直接加载均因 LM Studio CLI 无法解析该名称而失败，未发生自动回退；改用已安装模型键 `qwen/qwen3.8-27b` 并设置同名 identifier 后成功，随后以实际进程状态复核量化变体。
 - 里程碑 18 完成：将两种真实 OpenCode 同行摘要引导语加入严格白名单，未知后缀改为 `suspected_step_limit` 安全暂停。
 - Codex 独立发现并关闭三个边界：疑似识别漏掉其他合法裸标记变体、`reachedness` 词边界误报、resume 重复暂停。
 - 最终复核又补充“句点后无空格的未知后缀”回归。定向 3/3、全量 193/193、compileall、修改文件 Ruff 和 `git diff --check` 通过。
