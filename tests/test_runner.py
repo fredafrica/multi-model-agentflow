@@ -361,43 +361,41 @@ class RunnerTests(unittest.TestCase):
         ).start(plan, issue_authorization(plan), run_id="review-write-run")
         self.assertEqual(RunState.FAILED, result.state)
 
-    def test_p1_is_revised_and_rereviewed(self) -> None:
+    def test_p1_finding_pauses_without_revision(self) -> None:
         task = make_task("task-1")
         plan = make_plan(tasks=(task,))
-        review_count = 0
 
-        def reject_once(request: InvocationRequest) -> InvocationResult:
-            nonlocal review_count
+        def reject_with_p1(request: InvocationRequest) -> InvocationResult:
             if request.role in ("implementation", "revision"):
                 return approved_response(request)
-            review_count += 1
-            if review_count == 1:
-                output = json.dumps(
-                    {
-                        "approved": False,
-                        "findings": [
-                            {
-                                "severity": "P1",
-                                "title": "fix",
-                                "explanation": "test",
-                            }
-                        ],
-                    }
-                )
-                return InvocationResult(
-                    f"fake:{request.request_key}", output, 0, 0, 0, 0, 0, {"test_double": True}
-                )
-            return approved_response(request)
+            output = json.dumps(
+                {
+                    "approved": False,
+                    "findings": [
+                        {
+                            "severity": "P1",
+                            "title": "fix",
+                            "explanation": "test",
+                        }
+                    ],
+                }
+            )
+            return InvocationResult(
+                f"fake:{request.request_key}", output, 0, 0, 0, 0, 0, {"test_double": True}
+            )
 
-        adapter = FakeAdapter(responder=reject_once)
+        adapter = FakeAdapter(responder=reject_with_p1)
         result = Runner(self.database, adapter, self.workspace).start(
-            plan, issue_authorization(plan), run_id="revision-run"
+            plan, issue_authorization(plan), run_id="p1-pause-run"
         )
-        self.assertEqual(RunState.COMPLETED, result.state)
+        self.assertEqual(RunState.PAUSED, result.state)
         self.assertEqual(
-            ["implementation", "review", "revision", "rereview"],
+            ["implementation", "review"],
             [request.role for request in adapter.invocations],
         )
+        pending = self.database.pending_supervisor_checkpoints("p1-pause-run")
+        reasons = [item["reason"] for item in pending]
+        self.assertEqual(["p0_p1_finding"], reasons)
 
     def test_takeover_change_invalidates_only_affected_task(self) -> None:
         first = make_task("task-1")
@@ -592,6 +590,26 @@ class RunnerTests(unittest.TestCase):
             ["implementation", "review"],
             [request.role for request in adapter.invocations],
         )
+
+    def test_unknown_call_wakes_supervisor_with_canonical_reason(self) -> None:
+        task = make_task("task-1")
+        plan = make_plan(tasks=(task,))
+
+        def lost(request: InvocationRequest) -> InvocationResult:
+            if request.role == "implementation":
+                raise InvocationOutcomeUnknown("response lost", "provider-resolved")
+            return approved_response(request)
+
+        runner = Runner(
+            self.database, FakeAdapter(responder=lost), self.workspace
+        )
+        result = runner.start(
+            plan, issue_authorization(plan), run_id="unknown-wake-run"
+        )
+        self.assertEqual(RunState.PAUSED, result.state)
+        pending = self.database.pending_supervisor_checkpoints("unknown-wake-run")
+        reasons = [item["reason"] for item in pending]
+        self.assertEqual(["unknown_call"], reasons)
 
     def test_restart_after_completed_call_reuses_result(self) -> None:
         task = make_task("task-1")
@@ -790,6 +808,88 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(1, self.database.unresolved_unknown_calls("timeout-run"))
         with self.assertRaisesRegex(ValueError, "must be reconciled"):
             runner.resume("timeout-run", plan, authorization)
+
+    def test_timeout_wakes_supervisor_with_timeout_reason(self) -> None:
+        partial = "\n".join(
+            (
+                json.dumps({"type": "step_start", "sessionID": "sess-t", "part": {}}),
+                json.dumps(
+                    {"type": "step_finish", "part": {"tokens": {"input": 3, "output": 1}}}
+                ),
+            )
+        )
+
+        class TimingOutProcess:
+            pid = 5142
+            returncode = -15
+
+            def communicate(self, timeout=None):
+                raise subprocess.TimeoutExpired(("opencode", "run"), timeout or 0, output=partial)
+
+        real_popen = subprocess.Popen
+
+        def popen(command, **kwargs):
+            if command and command[0] == "opencode-stub":
+                return TimingOutProcess()
+            return real_popen(command, **kwargs)
+
+        task = replace(
+            make_task("task-1"),
+            implementation_model=ModelRef(
+                "lmstudio", "qwen/qwen3.8-27b", "1", "qwen", True
+            ),
+        )
+        plan = make_plan(tasks=(task,))
+        adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+        router = AdapterRouter({"lmstudio": adapter, "fake": FakeAdapter()})
+        runner = Runner(self.database, router, self.workspace)
+        with mock.patch("subprocess.Popen", side_effect=popen):
+            result = runner.start(plan, issue_authorization(plan), run_id="timeout-wake-run")
+        self.assertEqual(RunState.PAUSED, result.state)
+        reasons = [
+            checkpoint["reason"]
+            for checkpoint in self.database.pending_supervisor_checkpoints("timeout-wake-run")
+        ]
+        self.assertIn("timeout", reasons)
+        self.assertNotIn("unknown_call", reasons)
+
+    def test_unknown_call_reason_maps_termination_reasons(self) -> None:
+        timeout = InvocationOutcomeUnknown(
+            "timed out",
+            "adapter",
+            result=InvocationResult("p", "out", 0, 0, 0, 0, 0, {"termination_reason": "timeout"}),
+            termination_reason="timeout",
+        )
+        signal = InvocationOutcomeUnknown(
+            "killed",
+            "adapter",
+            result=InvocationResult("p", "out", 0, 0, 0, 0, 0, {"termination_reason": "signal_terminated"}),
+            termination_reason="signal_terminated",
+        )
+        unknown = InvocationOutcomeUnknown("gone", "adapter")
+        self.assertEqual("timeout", Runner._unknown_call_reason(timeout))
+        self.assertEqual("signal_terminated", Runner._unknown_call_reason(signal))
+        self.assertEqual("unknown_call", Runner._unknown_call_reason(unknown))
+
+    def test_file_scope_violation_wakes_scope_violation_reason(self) -> None:
+        task = make_task("task-1")
+        plan = make_plan(tasks=(task,))
+
+        def write_outside(request: InvocationRequest) -> InvocationResult:
+            result = approved_response(request)
+            if request.role == "implementation":
+                (Path(request.metadata["worktree"]) / "outside.txt").write_text("bad")
+            return result
+
+        result = Runner(
+            self.database, FakeAdapter(responder=write_outside), self.workspace
+        ).start(plan, issue_authorization(plan), run_id="scope-wake-run")
+        self.assertEqual(RunState.FAILED, result.state)
+        reasons = [
+            checkpoint["reason"]
+            for checkpoint in self.database.pending_supervisor_checkpoints("scope-wake-run")
+        ]
+        self.assertIn("scope_violation", reasons)
 
 
 class ContinuationTests(unittest.TestCase):
@@ -1544,14 +1644,12 @@ class ContinuationTests(unittest.TestCase):
         begin_call = self.database.begin_call
         injected: list[bool] = []
 
-        def register_continuation_then_crash(
-            request, attempt_id, *, reuse_planned=False
-        ):
+        def register_continuation_then_crash(request, attempt_id, **kwargs):
             if request.metadata.get("segment_index", 0) >= 1 and not injected:
                 injected.append(True)
                 self.database.register_call(request, attempt_id)
                 raise KeyboardInterrupt("simulated crash before start")
-            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+            return begin_call(request, attempt_id, **kwargs)
 
         with mock.patch.object(
             self.database, "begin_call", side_effect=register_continuation_then_crash
@@ -1608,15 +1706,13 @@ class ContinuationTests(unittest.TestCase):
         begin_call = self.database.begin_call
         injected: list[bool] = []
 
-        def pause_before_continuation_start(
-            request, attempt_id, *, reuse_planned=False
-        ):
+        def pause_before_continuation_start(request, attempt_id, **kwargs):
             if request.metadata.get("segment_index", 0) >= 1 and not injected:
                 injected.append(True)
                 self.database.transition_control(
                     "pause-toctou-run", ControlState.PAUSE_REQUESTED
                 )
-            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+            return begin_call(request, attempt_id, **kwargs)
 
         with mock.patch.object(
             self.database, "begin_call", side_effect=pause_before_continuation_start
@@ -1678,12 +1774,12 @@ class ContinuationTests(unittest.TestCase):
         begin_call = self.database.begin_call
         injected: list[bool] = []
 
-        def register_base_then_crash(request, attempt_id, *, reuse_planned=False):
+        def register_base_then_crash(request, attempt_id, **kwargs):
             if request.metadata.get("segment_index", 0) == 0 and not injected:
                 injected.append(True)
                 self.database.register_call(request, attempt_id)
                 raise KeyboardInterrupt("simulated crash before base start")
-            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+            return begin_call(request, attempt_id, **kwargs)
 
         with mock.patch.object(
             self.database, "begin_call", side_effect=register_base_then_crash
@@ -1842,14 +1938,12 @@ class ContinuationTests(unittest.TestCase):
         begin_call = database.begin_call
         injected: list[bool] = []
 
-        def register_continuation_then_crash(
-            request, attempt_id, *, reuse_planned=False
-        ):
+        def register_continuation_then_crash(request, attempt_id, **kwargs):
             if request.metadata.get("segment_index", 0) >= 1 and not injected:
                 injected.append(True)
                 database.register_call(request, attempt_id)
                 raise KeyboardInterrupt("simulated crash before start")
-            return begin_call(request, attempt_id, reuse_planned=reuse_planned)
+            return begin_call(request, attempt_id, **kwargs)
 
         with mock.patch.object(
             database, "begin_call", side_effect=register_continuation_then_crash

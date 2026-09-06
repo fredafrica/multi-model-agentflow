@@ -9,6 +9,8 @@ from .adapters import (
     InvocationIncompleteError,
     InvocationOutcomeUnknown,
     ModelAdapter,
+    ReviewerProtocolError,
+    WorkerProtocolError,
 )
 from .authorization import validate_authorization
 from .contracts import (
@@ -19,12 +21,21 @@ from .contracts import (
     TaskContract,
 )
 from .database import Database
-from .policies import invocation_decision
+from .policies import classify_policy_denial, invocation_decision
 from .states import InvocationState
 
 
 class PolicyDeniedError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        reason_code: str = "authorization_violation",
+        reasons: tuple[str, ...] = (),
+    ) -> None:
+        super().__init__(message)
+        self.reason_code = reason_code
+        self.reasons = tuple(reasons)
 
 
 class ConfirmationRequiredError(RuntimeError):
@@ -76,15 +87,46 @@ class InvocationService:
                 request.model.registry_key,
                 decision.reasons,
             )
-            raise PolicyDeniedError("; ".join(decision.reasons))
+            raise PolicyDeniedError(
+                "; ".join(decision.reasons),
+                reason_code=classify_policy_denial(decision.reasons),
+                reasons=decision.reasons,
+            )
         if decision.requires_confirmation and not confirmed:
             raise ConfirmationRequiredError("this invocation requires explicit confirmation")
 
+        if request.model.is_local:
+            budget_estimated: float | None = None
+            budget_usable: float | None = None
+        else:
+            budget_estimated = context.estimated_remote_cost
+            budget_usable = max(
+                0.0,
+                context.authorization.max_remote_cost - context.plan.emergency_reserve,
+            )
         row, outcome = self.database.begin_call(
-            request, context.attempt_id, reuse_planned=reuse_planned
+            request,
+            context.attempt_id,
+            reuse_planned=reuse_planned,
+            estimated_remote_cost=budget_estimated,
+            usable_budget=budget_usable,
         )
         if outcome == "PAUSE_BLOCKED":
             raise PauseBlockedError("run is no longer running; call was not started")
+        if outcome == "BUDGET_BLOCKED":
+            reasons = ("budget denied: remote cost would exceed the usable budget",)
+            self.database.record_policy_denial(
+                request.run_id,
+                request.call_id,
+                request.task_id,
+                request.model.registry_key,
+                reasons,
+            )
+            raise PolicyDeniedError(
+                "; ".join(reasons),
+                reason_code=classify_policy_denial(reasons),
+                reasons=reasons,
+            )
         if outcome == "REUSED_COMPLETED":
             return self._reused_result(row)
 
@@ -128,7 +170,37 @@ class InvocationService:
                     self.database.set_provider_request_id(
                         call_id, error.provider_request_id
                     )
-                self.database.transition_call(call_id, InvocationState.UNKNOWN)
+                result = InvocationResult(
+                    provider_request_id=error.provider_request_id,
+                    output="",
+                    input_tokens=0,
+                    output_tokens=0,
+                    first_token_latency_ms=None,
+                    duration_ms=0,
+                    remote_cost=0.0 if request.model.is_local else None,
+                    raw_metadata={
+                        "termination_reason": error.termination_reason or "unknown",
+                        "token_source": "unavailable",
+                        "usage_unavailable": True,
+                    },
+                )
+                self.database.mark_call_unknown(
+                    call_id, error.provider_request_id, result
+                )
+            raise
+        except (ReviewerProtocolError, WorkerProtocolError) as error:
+            result = error.result
+            if result is not None:
+                if request.model.is_local:
+                    result = replace(result, remote_cost=0.0, cost_unavailable=False)
+                self.database.fail_call(
+                    call_id,
+                    result,
+                    request.run_id,
+                    failure_kind="protocol_error",
+                )
+            else:
+                self.database.transition_call(call_id, InvocationState.FAILED)
             raise
         except Exception:
             self.database.transition_call(call_id, InvocationState.FAILED)
@@ -163,11 +235,13 @@ class InvocationService:
             return None
         if isinstance(self.adapter, AdapterRouter):
             result = self.adapter.query_provider(
-                str(row["provider"]), str(provider_request_id)
+                str(row["provider"]), str(provider_request_id), str(row["role"])
             )
         else:
             result = self.adapter.query(str(provider_request_id))
         if result is None:
             return None
+        if row["is_local"]:
+            result = replace(result, remote_cost=0.0, cost_unavailable=False)
         self.database.complete_call(call_id, result, run_id)
         return result

@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
-import signal
 import shutil
+import signal
 import subprocess
 import tempfile
 import time
@@ -20,15 +21,22 @@ from .adapters import (
     InvocationOutcomeUnknown,
     ModelUnavailableError,
     ProviderNotConfiguredError,
+    ReviewerProtocolError,
     UnsupportedProviderError,
+    WorkerProtocolError,
 )
 from .contracts import (
-    BusinessImportance,
     DEFAULT_IMPLEMENTATION_MAX_STEPS,
     DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
+    DEFAULT_REMOTE_WORKER_MAX_STEPS,
+    DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS,
     IMPLEMENTATION_MAX_STEPS_LIMIT,
     IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT,
     IMPLEMENTATION_TIMEOUT_SECONDS_MIN,
+    REMOTE_WORKER_MAX_STEPS_LIMIT,
+    REMOTE_WORKER_TIMEOUT_SECONDS_LIMIT,
+    REMOTE_WORKER_TIMEOUT_SECONDS_MIN,
+    BusinessImportance,
     InvocationRequest,
     InvocationResult,
     ModelAvailabilityState,
@@ -38,7 +46,6 @@ from .contracts import (
     validate_model_id,
     validate_provider_id,
 )
-
 
 # One normal reviewer response turn plus OpenCode's bounded finalization turn.
 REMOTE_REVIEWER_MAX_STEPS = 2
@@ -149,17 +156,19 @@ class OpenCodeAdapter:
             stdout, stderr = process.communicate(timeout=timeout_seconds)
         except subprocess.TimeoutExpired as error:
             self.cancel(process_reference)
-            partial_stdout = _collect_timeout_output(error, process)
+            partial_stdout, cleanup_incomplete = _collect_timeout_output(error, process)
             duration_ms = int((time.monotonic() - started) * 1000)
             result = parse_opencode_partial_usage(
                 partial_stdout,
                 duration_ms=duration_ms,
                 timeout_seconds=timeout_seconds,
+                cleanup_incomplete=cleanup_incomplete,
             )
             raise InvocationOutcomeUnknown(
                 "OpenCode timed out; inspect the local worktree before retrying",
                 process_reference,
                 result=result,
+                termination_reason="timeout",
             ) from error
         duration_ms = int((time.monotonic() - started) * 1000)
         if process.returncode is not None and process.returncode < 0:
@@ -167,6 +176,7 @@ class OpenCodeAdapter:
                 "OpenCode was terminated by a signal; inspect the local worktree "
                 "before retrying",
                 process_reference,
+                termination_reason="signal_terminated",
             )
         if process.returncode:
             try:
@@ -264,6 +274,44 @@ class OpenCodeAdapter:
         )
 
 
+def _discover_remote_model_ids(
+    provider: str,
+    opencode_command: str,
+    *,
+    discovery_timeout_seconds: int,
+) -> tuple[str, ...]:
+    """Return the configured model IDs for a remote provider, without inference."""
+    try:
+        result = subprocess.run(
+            (opencode_command, "models", provider, "--pure"),
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=discovery_timeout_seconds,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired) as error:
+        raise UnsupportedProviderError(
+            "unsupported provider: OpenCode model discovery is unavailable"
+        ) from error
+    if result.returncode:
+        raise ProviderNotConfiguredError(
+            f"provider not configured: {provider}"
+        )
+    prefix = f"{provider}/"
+    model_ids = tuple(
+        line.strip().removeprefix(prefix)
+        for line in result.stdout.splitlines()
+        if line.strip().startswith(prefix)
+    )
+    if not model_ids:
+        raise ProviderNotConfiguredError(
+            f"provider not configured: {provider}"
+        )
+    for model_id in model_ids:
+        validate_model_id(model_id)
+    return model_ids
+
+
 class RemoteOpenCodeReviewerAdapter:
     """Run an authorized remote reviewer with no repository or tool access."""
 
@@ -293,35 +341,11 @@ class RemoteOpenCodeReviewerAdapter:
         self.adapter_id = f"opencode-remote-review:{self.provider}"
 
     def _discover_model_ids(self) -> tuple[str, ...]:
-        try:
-            result = subprocess.run(
-                (self.opencode_command, "models", self.provider, "--pure"),
-                text=True,
-                capture_output=True,
-                check=False,
-                timeout=self.discovery_timeout_seconds,
-            )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as error:
-            raise UnsupportedProviderError(
-                "unsupported provider: OpenCode model discovery is unavailable"
-            ) from error
-        if result.returncode:
-            raise ProviderNotConfiguredError(
-                f"provider not configured: {self.provider}"
-            )
-        prefix = f"{self.provider}/"
-        model_ids = tuple(
-            line.strip().removeprefix(prefix)
-            for line in result.stdout.splitlines()
-            if line.strip().startswith(prefix)
+        return _discover_remote_model_ids(
+            self.provider,
+            self.opencode_command,
+            discovery_timeout_seconds=self.discovery_timeout_seconds,
         )
-        if not model_ids:
-            raise ProviderNotConfiguredError(
-                f"provider not configured: {self.provider}"
-            )
-        for model_id in model_ids:
-            validate_model_id(model_id)
-        return model_ids
 
     def discover(self) -> Sequence[ModelRecord]:
         discovered = set(self._discover_model_ids())
@@ -402,9 +426,28 @@ class RemoteOpenCodeReviewerAdapter:
                 callback(process_reference)
             try:
                 stdout, stderr = process.communicate(timeout=self.timeout_seconds)
-            except (subprocess.TimeoutExpired, KeyboardInterrupt, OSError) as error:
+            except subprocess.TimeoutExpired as error:
                 OpenCodeAdapter().cancel(process_reference)
-                process.communicate()
+                partial_stdout, cleanup_incomplete = _collect_timeout_output(
+                    error, process
+                )
+                duration_ms = int((time.monotonic() - started) * 1000)
+                result = parse_opencode_partial_usage(
+                    partial_stdout,
+                    duration_ms=duration_ms,
+                    timeout_seconds=self.timeout_seconds,
+                    cost_unavailable=True,
+                    cleanup_incomplete=cleanup_incomplete,
+                )
+                raise InvocationOutcomeUnknown(
+                    "remote OpenCode review timed out; no result is available",
+                    process_reference,
+                    result=result,
+                    termination_reason="timeout",
+                ) from error
+            except (KeyboardInterrupt, OSError) as error:
+                OpenCodeAdapter().cancel(process_reference)
+                _bounded_drain(process)
                 raise InvocationOutcomeUnknown(
                     "invocation outcome unknown: remote OpenCode review was interrupted",
                     process_reference,
@@ -414,6 +457,7 @@ class RemoteOpenCodeReviewerAdapter:
                 raise InvocationOutcomeUnknown(
                     "invocation outcome unknown: remote OpenCode review was terminated",
                     process_reference,
+                    termination_reason="signal_terminated",
                 )
             if process.returncode:
                 try:
@@ -422,9 +466,16 @@ class RemoteOpenCodeReviewerAdapter:
                     raise
                 except RuntimeError:
                     pass
-                raise ModelUnavailableError(
-                    "model unavailable: "
-                    + (stderr.strip() or f"{self.provider}/{request.model.model_id}")
+                failed_usage = parse_opencode_failed_usage(
+                    _as_output_bytes(stdout),
+                    duration_ms=duration_ms,
+                    is_local=False,
+                    termination_reason="nonzero_exit",
+                )
+                raise ReviewerProtocolError(
+                    "remote reviewer failed: "
+                    + (stderr.strip() or f"{self.provider}/{request.model.model_id}"),
+                    result=failed_usage,
                 )
             try:
                 return parse_opencode_json(
@@ -433,8 +484,14 @@ class RemoteOpenCodeReviewerAdapter:
             except InvocationIncompleteError:
                 raise
             except RuntimeError as error:
-                raise ModelUnavailableError(
-                    "model unavailable: remote reviewer returned no usable result"
+                failed_usage = parse_opencode_failed_usage(
+                    _as_output_bytes(stdout),
+                    duration_ms=duration_ms,
+                    is_local=False,
+                    termination_reason="no_usable_result",
+                )
+                raise ReviewerProtocolError(
+                    "remote reviewer returned no usable result", result=failed_usage
                 ) from error
 
     def query(self, provider_request_id: str) -> InvocationResult | None:
@@ -476,6 +533,243 @@ class RemoteOpenCodeReviewerAdapter:
         }
 
 
+class RemoteOpenCodeWorkerAdapter:
+    """Run an authorized remote implementation/revision worker with network denied."""
+
+    def __init__(
+        self,
+        provider: str,
+        *,
+        planned_models: Sequence[ModelRef] = (),
+        opencode_command: str | None = None,
+        timeout_seconds: int = DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS,
+        discovery_timeout_seconds: int = 15,
+        test_double: bool = False,
+    ) -> None:
+        self.provider = validate_provider_id(provider)
+        if self.provider in {"fake", "lmstudio"}:
+            raise UnsupportedProviderError(
+                f"unsupported provider for remote worker: {self.provider}"
+            )
+        for model in planned_models:
+            if model.provider != self.provider or model.is_local:
+                raise ValueError("planned remote models must match the adapter provider")
+        self.planned_models = tuple(planned_models)
+        self.opencode_command = opencode_command or shutil.which("opencode") or "opencode"
+        self.timeout_seconds = timeout_seconds
+        self.discovery_timeout_seconds = discovery_timeout_seconds
+        self.test_double = test_double
+        self.adapter_id = f"opencode-remote-worker:{self.provider}"
+
+    def _discover_model_ids(self) -> tuple[str, ...]:
+        return _discover_remote_model_ids(
+            self.provider,
+            self.opencode_command,
+            discovery_timeout_seconds=self.discovery_timeout_seconds,
+        )
+
+    def discover(self) -> Sequence[ModelRecord]:
+        discovered = set(self._discover_model_ids())
+        refs = self.planned_models or tuple(
+            ModelRef(self.provider, model_id, model_id, is_local=False)
+            for model_id in sorted(discovered)
+        )
+        return tuple(
+            ModelRecord(
+                ref=model,
+                available=False,
+                context_length=None,
+                tool_capable=False,
+                input_cost_per_million=None,
+                output_cost_per_million=None,
+                measured_tokens_per_second=None,
+                trust_level=TrustLevel.UNVERIFIED,
+                highest_allowed_risk=BusinessImportance.NORMAL,
+                availability_state=(
+                    ModelAvailabilityState.DISCOVERABLE
+                    if model.model_id in discovered
+                    else ModelAvailabilityState.UNAVAILABLE
+                ),
+            )
+            for model in refs
+        )
+
+    def require_model(self, model: ModelRef) -> None:
+        if model.provider != self.provider or model.is_local:
+            raise UnsupportedProviderError(
+                f"unsupported provider/model locality: {model.provider}"
+            )
+        if model.model_id not in self._discover_model_ids():
+            raise ModelUnavailableError(
+                f"model unavailable: {self.provider}/{model.model_id}"
+            )
+
+    def invoke(self, request: InvocationRequest) -> InvocationResult:
+        if request.role not in {"implementation", "revision"}:
+            raise ValueError("remote role denied: only implementation and revision are allowed")
+        if request.read_only:
+            raise ValueError("remote role denied: implementation must be a write role")
+        self.require_model(request.model)
+        worktree = Path(str(request.metadata["worktree"])).resolve()
+        if not worktree.is_dir():
+            raise ValueError("invocation worktree does not exist")
+        steps = _remote_worker_steps(request.metadata)
+        timeout_seconds = _remote_worker_timeout(
+            request.metadata, default=self.timeout_seconds
+        )
+        environment = os.environ.copy()
+        environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+            self._permission_config(steps=steps), separators=(",", ":")
+        )
+        command = (
+            self.opencode_command,
+            "run",
+            "--format",
+            "json",
+            "--pure",
+            "--auto",
+            "--agent",
+            "agentflow-remote-worker",
+            "--model",
+            f"{self.provider}/{request.model.model_id}",
+            "--dir",
+            str(worktree),
+            OpenCodeAdapter._bounded_prompt(request),
+        )
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+        process_reference = f"opencode-process-group:{process.pid}"
+        callback = request.metadata.get("on_provider_request_id")
+        if callable(callback):
+            callback(process_reference)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            OpenCodeAdapter().cancel(process_reference)
+            partial_stdout, cleanup_incomplete = _collect_timeout_output(error, process)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = parse_opencode_partial_usage(
+                partial_stdout,
+                duration_ms=duration_ms,
+                timeout_seconds=timeout_seconds,
+                cost_unavailable=True,
+                cleanup_incomplete=cleanup_incomplete,
+            )
+            raise InvocationOutcomeUnknown(
+                "remote OpenCode worker timed out; no result is available",
+                process_reference,
+                result=result,
+                termination_reason="timeout",
+            ) from error
+        except (KeyboardInterrupt, OSError) as error:
+            OpenCodeAdapter().cancel(process_reference)
+            _bounded_drain(process)
+            raise InvocationOutcomeUnknown(
+                "invocation outcome unknown: remote OpenCode worker was interrupted",
+                process_reference,
+            ) from error
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if process.returncode is not None and process.returncode < 0:
+            raise InvocationOutcomeUnknown(
+                "invocation outcome unknown: remote OpenCode worker was terminated",
+                process_reference,
+                termination_reason="signal_terminated",
+            )
+        if process.returncode:
+            try:
+                parse_opencode_json(
+                    stdout,
+                    duration_ms=duration_ms,
+                    is_local=False,
+                    configured_step_limit=steps,
+                )
+            except InvocationIncompleteError:
+                raise
+            except RuntimeError:
+                pass
+            failed_usage = parse_opencode_failed_usage(
+                _as_output_bytes(stdout),
+                duration_ms=duration_ms,
+                is_local=False,
+                termination_reason="nonzero_exit",
+            )
+            raise WorkerProtocolError(
+                stderr.strip()
+                or f"remote worker failed: {self.provider}/{request.model.model_id}",
+                result=failed_usage,
+            )
+        try:
+            return parse_opencode_json(
+                stdout,
+                duration_ms=duration_ms,
+                is_local=False,
+                configured_step_limit=steps,
+            )
+        except InvocationIncompleteError:
+            raise
+        except RuntimeError as error:
+            failed_usage = parse_opencode_failed_usage(
+                _as_output_bytes(stdout),
+                duration_ms=duration_ms,
+                is_local=False,
+                termination_reason="no_usable_result",
+            )
+            raise WorkerProtocolError(
+                "remote worker returned no usable result", result=failed_usage
+            ) from error
+
+    def query(self, provider_request_id: str) -> InvocationResult | None:
+        return None
+
+    def cancel(self, provider_request_id: str) -> bool:
+        return OpenCodeAdapter().cancel(provider_request_id)
+
+    def _permission_config(self, *, steps: int) -> dict[str, Any]:
+        permission = {
+            "*": "deny",
+            "read": {
+                "*": "allow",
+                ".env": "deny",
+                ".env.*": "deny",
+                "**/.env": "deny",
+                "**/.env.*": "deny",
+            },
+            "glob": "allow",
+            "grep": "allow",
+            "edit": "allow",
+            "write": "allow",
+            "bash": "deny",
+            "shell": "deny",
+            "external_directory": "deny",
+            "webfetch": "deny",
+            "websearch": "deny",
+            "task": "deny",
+            "subagent": "deny",
+            "skill": "deny",
+            "question": "deny",
+        }
+        return {
+            "$schema": "https://opencode.ai/config.json",
+            "enabled_providers": [self.provider],
+            "permission": permission,
+            "agent": {
+                "agentflow-remote-worker": {
+                    "description": "Bounded remote AgentFlow worker",
+                    "mode": "primary",
+                    "steps": steps,
+                    "permission": permission,
+                }
+            },
+        }
+
+
 def _implementation_steps(metadata: Mapping[str, Any]) -> int:
     value = metadata.get("implementation_max_steps", DEFAULT_IMPLEMENTATION_MAX_STEPS)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -484,6 +778,31 @@ def _implementation_steps(metadata: Mapping[str, Any]) -> int:
         raise ValueError(
             "implementation_max_steps must be between 1 and "
             f"{IMPLEMENTATION_MAX_STEPS_LIMIT}"
+        )
+    return value
+
+
+def _remote_worker_steps(metadata: Mapping[str, Any]) -> int:
+    value = metadata.get("remote_worker_max_steps", DEFAULT_REMOTE_WORKER_MAX_STEPS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("remote_worker_max_steps must be a positive integer")
+    if not 1 <= value <= REMOTE_WORKER_MAX_STEPS_LIMIT:
+        raise ValueError(
+            "remote_worker_max_steps must be between 1 and "
+            f"{REMOTE_WORKER_MAX_STEPS_LIMIT}"
+        )
+    return value
+
+
+def _remote_worker_timeout(metadata: Mapping[str, Any], *, default: int) -> int:
+    value = metadata.get("remote_worker_timeout_seconds", default)
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, int):
+        raise ValueError("remote_worker_timeout_seconds must be an integer")
+    if not REMOTE_WORKER_TIMEOUT_SECONDS_MIN <= value <= REMOTE_WORKER_TIMEOUT_SECONDS_LIMIT:
+        raise ValueError(
+            "remote_worker_timeout_seconds must be between "
+            f"{REMOTE_WORKER_TIMEOUT_SECONDS_MIN} and "
+            f"{REMOTE_WORKER_TIMEOUT_SECONDS_LIMIT}"
         )
     return value
 
@@ -564,27 +883,101 @@ def _merge_overlapping_output_bytes(first: bytes, second: bytes) -> bytes:
     return first + second
 
 
+_DRAIN_GRACE_SECONDS = 5.0
+_DRAIN_KILL_GRACE_SECONDS = 2.0
+
+
+def _kill_process_group(process: subprocess.Popen) -> None:
+    """SIGKILL the process group after SIGTERM was ignored, best-effort.
+
+    A process that ignores SIGTERM must be reaped so the caller never blocks
+    indefinitely. SIGKILL targets the whole process group; if that is not
+    available the process itself is killed directly.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            process.kill()
+        except Exception:
+            pass
+
+
+def _bounded_drain(
+    process: subprocess.Popen, *, partial: bytes = b""
+) -> tuple[bytes, bool]:
+    """Drain stdout after cancellation within a finite grace, escalating to kill.
+
+    ``partial`` is output already captured before cancellation. Every wait is
+    bounded: the first drain ``communicate`` uses the grace period, and after a
+    best-effort SIGKILL the final reap uses a second, shorter bound. If that
+    final wait also times out (a descendant still holds the pipe, or the kill
+    failed) the already-captured bytes are returned together with a
+    ``cleanup_incomplete`` diagnostic, never a fabricated "process exited" claim.
+    The caller preserves UNKNOWN diagnostics and captured usage from the bytes.
+    """
+    merged = partial
+    cleanup_incomplete = False
+    try:
+        second_stdout, _ = process.communicate(timeout=_DRAIN_GRACE_SECONDS)
+        merged = _merge_overlapping_output_bytes(
+            merged, _as_output_bytes(second_stdout)
+        )
+    except subprocess.TimeoutExpired as drain_error:
+        merged = _merge_overlapping_output_bytes(
+            merged, _as_output_bytes(drain_error.output)
+        )
+        _kill_process_group(process)
+        try:
+            third_stdout, _ = process.communicate(timeout=_DRAIN_KILL_GRACE_SECONDS)
+            merged = _merge_overlapping_output_bytes(
+                merged, _as_output_bytes(third_stdout)
+            )
+        except subprocess.TimeoutExpired as final_error:
+            merged = _merge_overlapping_output_bytes(
+                merged, _as_output_bytes(final_error.output)
+            )
+            cleanup_incomplete = True
+        except Exception:
+            cleanup_incomplete = True
+    except Exception:
+        pass
+    return merged, cleanup_incomplete
+
+
 def _collect_timeout_output(
     error: subprocess.TimeoutExpired, process: subprocess.Popen
-) -> bytes:
-    first = _as_output_bytes(error.output)
+) -> tuple[bytes, bool]:
+    return _bounded_drain(process, partial=_as_output_bytes(error.output))
+
+
+def _valid_cost_value(value: object) -> float | None:
+    """Return a finite non-negative cost value, or ``None`` when invalid.
+
+    Only ``int``/``float`` (never ``bool``) counts are accepted. Negative, NaN,
+    infinite, and non-numeric values (including numeric strings) are invalid and
+    return ``None`` so the caller can mark the cost unavailable instead of
+    fabricating a settled amount.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
     try:
-        second_stdout, _ = process.communicate()
-    except Exception:
-        second_stdout = b""
-    return _merge_overlapping_output_bytes(first, _as_output_bytes(second_stdout))
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(number) or number < 0:
+        return None
+    return number
 
 
-def parse_opencode_partial_usage(
-    data: bytes, *, duration_ms: int, timeout_seconds: int
-) -> InvocationResult:
-    """Extract conservative usage evidence from partial OpenCode JSON events.
+def _scan_usage_events(data: bytes) -> dict[str, object]:
+    """Sum confirmed token/cost/session evidence from a partial OpenCode stream.
 
-    The output text is intentionally empty: a timed-out call has no confirmed
-    result. Each completed step reports its own token usage, so every real
-    token-bearing event in the merged stream is summed. Overlap between the two
-    reads is removed at the raw byte-stream level before decoding; events are
-    never de-duplicated by their content.
+    Every token- or cost-bearing event is summed; events are never de-duplicated
+    by content. Invalid cost values (negative, NaN, infinite, bool, string) are
+    never treated as a valid amount and instead mark the whole stream's cost as
+    invalid, so a mixed valid/invalid stream cannot masquerade as a complete
+    settled cost. Returns the accumulated usage plus the first session id.
     """
     text = data.decode("utf-8", errors="replace")
     input_tokens = 0
@@ -595,6 +988,9 @@ def parse_opencode_partial_usage(
     event_count = 0
     completed_step_count = 0
     saw_usage = False
+    reported_cost = 0.0
+    cost_reported = False
+    cost_invalid = False
 
     for raw_line in text.splitlines():
         if not raw_line.strip():
@@ -602,6 +998,8 @@ def parse_opencode_partial_usage(
         try:
             event = json.loads(raw_line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, Mapping):
             continue
         event_count += 1
         provider_request_id = provider_request_id or _find_string(
@@ -621,29 +1019,129 @@ def parse_opencode_partial_usage(
         if reasoning:
             saw_reasoning = True
             reasoning_tokens += reasoning
+        cost = part.get("cost", event.get("cost"))
+        if cost is not None:
+            valid = _valid_cost_value(cost)
+            if valid is None:
+                cost_invalid = True
+            else:
+                reported_cost += valid
+                if not math.isfinite(reported_cost):
+                    cost_invalid = True
+                else:
+                    cost_reported = True
 
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_tokens": reasoning_tokens,
+        "saw_reasoning": saw_reasoning,
+        "provider_request_id": provider_request_id,
+        "event_count": event_count,
+        "completed_step_count": completed_step_count,
+        "saw_usage": saw_usage,
+        "reported_cost": reported_cost,
+        "cost_reported": cost_reported,
+        "cost_invalid": cost_invalid,
+    }
+
+
+def parse_opencode_partial_usage(
+    data: bytes,
+    *,
+    duration_ms: int,
+    timeout_seconds: int,
+    cost_unavailable: bool = False,
+    cleanup_incomplete: bool = False,
+) -> InvocationResult:
+    """Extract conservative usage evidence from partial OpenCode JSON events.
+
+    The output text is intentionally empty: a timed-out call has no confirmed
+    result. Each completed step reports its own token usage, so every real
+    token-bearing event in the merged stream is summed. Overlap between the two
+    reads is removed at the raw byte-stream level before decoding; events are
+    never de-duplicated by their content. For remote calls ``cost_unavailable``
+    marks the remote cost as unavailable rather than reporting a fabricated zero.
+    """
+    scan = _scan_usage_events(data)
     metadata = {
         "termination_reason": "timeout",
         "timeout_seconds": timeout_seconds,
-        "token_source": "opencode_json_events" if saw_usage else "unavailable",
-        "usage_unavailable": not saw_usage,
-        "event_count": event_count,
-        "completed_step_count": completed_step_count,
-        "session_id": provider_request_id,
-        "reasoning_tokens": reasoning_tokens if saw_reasoning else None,
+        "token_source": (
+            "opencode_json_events" if scan["saw_usage"] else "unavailable"
+        ),
+        "usage_unavailable": not scan["saw_usage"],
+        "event_count": scan["event_count"],
+        "completed_step_count": scan["completed_step_count"],
+        "session_id": scan["provider_request_id"],
+        "reasoning_tokens": (
+            scan["reasoning_tokens"] if scan["saw_reasoning"] else None
+        ),
         "partial_stdout_bytes": len(data),
         "partial_stdout_sha256": hashlib.sha256(data).hexdigest(),
+        "cleanup_incomplete": cleanup_incomplete,
+        "cost_invalid": scan["cost_invalid"],
     }
     return InvocationResult(
-        provider_request_id=provider_request_id,
+        provider_request_id=scan["provider_request_id"],
         output="",
-        input_tokens=input_tokens,
-        output_tokens=output_tokens,
+        input_tokens=scan["input_tokens"],
+        output_tokens=scan["output_tokens"],
         first_token_latency_ms=None,
         duration_ms=duration_ms,
-        remote_cost=0.0,
+        remote_cost=None if cost_unavailable else 0.0,
         raw_metadata=metadata,
-        cost_unavailable=False,
+        cost_unavailable=cost_unavailable,
+    )
+
+
+def parse_opencode_failed_usage(
+    data: bytes,
+    *,
+    duration_ms: int,
+    is_local: bool,
+    termination_reason: str,
+) -> InvocationResult:
+    """Extract confirmed usage from a post-call failure's stdout.
+
+    A process that exited non-zero (or returned no usable body) still reported
+    real token and cost evidence on ``step_finish`` events. That evidence is
+    confirmed, not fabricated, so it must be preserved even though the call
+    failed. With no cost evidence the remote cost stays ``None`` (unavailable)
+    instead of reporting a false zero.
+    """
+    scan = _scan_usage_events(data)
+    cost_usable = scan["cost_reported"] and not scan["cost_invalid"]
+    metadata = {
+        "termination_reason": termination_reason,
+        "token_source": (
+            "opencode_json_events" if scan["saw_usage"] else "unavailable"
+        ),
+        "usage_unavailable": not scan["saw_usage"],
+        "event_count": scan["event_count"],
+        "completed_step_count": scan["completed_step_count"],
+        "session_id": scan["provider_request_id"],
+        "reasoning_tokens": (
+            scan["reasoning_tokens"] if scan["saw_reasoning"] else None
+        ),
+        "reported_cost": scan["reported_cost"] if cost_usable else None,
+        "cost_invalid": scan["cost_invalid"],
+        "cost_unavailable": not is_local and not cost_usable,
+        "stdout_bytes": len(data),
+        "stdout_sha256": hashlib.sha256(data).hexdigest(),
+    }
+    return InvocationResult(
+        provider_request_id=scan["provider_request_id"],
+        output="",
+        input_tokens=scan["input_tokens"],
+        output_tokens=scan["output_tokens"],
+        first_token_latency_ms=None,
+        duration_ms=duration_ms,
+        remote_cost=(
+            0.0 if is_local else (scan["reported_cost"] if cost_usable else None)
+        ),
+        raw_metadata=metadata,
+        cost_unavailable=not is_local and not cost_usable,
     )
 
 
@@ -663,6 +1161,7 @@ def parse_opencode_json(
     first_token_latency_ms: int | None = None
     reported_cost = 0.0
     cost_reported = False
+    cost_invalid = False
     event_types: list[str] = []
     structured_step_limit = False
     step_start_count = 0
@@ -679,6 +1178,8 @@ def parse_opencode_json(
         try:
             event = json.loads(raw_line)
         except json.JSONDecodeError:
+            continue
+        if not isinstance(event, Mapping):
             continue
         event_type = str(event.get("type", "unknown"))
         event_types.append(event_type)
@@ -715,9 +1216,16 @@ def parse_opencode_json(
             saw_reasoning = True
             reasoning_tokens += reasoning
         cost = part.get("cost", event.get("cost"))
-        if isinstance(cost, (int, float)):
-            reported_cost += float(cost)
-            cost_reported = True
+        if cost is not None:
+            valid = _valid_cost_value(cost)
+            if valid is None:
+                cost_invalid = True
+            else:
+                reported_cost += valid
+                if not math.isfinite(reported_cost):
+                    cost_invalid = True
+                else:
+                    cost_reported = True
 
     output = "".join(output_parts).strip()
     if not output and not structured_step_limit:
@@ -739,10 +1247,12 @@ def parse_opencode_json(
         termination_source = None
         failure_kind = None
 
+    cost_usable = cost_reported and not cost_invalid
     metadata: dict[str, Any] = {
         "event_types": event_types,
-        "reported_cost": reported_cost if cost_reported else None,
-        "cost_unavailable": not is_local and not cost_reported,
+        "reported_cost": reported_cost if cost_usable else None,
+        "cost_invalid": cost_invalid,
+        "cost_unavailable": not is_local and not cost_usable,
         "reasoning_tokens": reasoning_tokens if saw_reasoning else None,
         "classifier_version": _CLASSIFIER_VERSION,
         "step_start_count": step_start_count,
@@ -769,9 +1279,9 @@ def parse_opencode_json(
         output_tokens=output_tokens,
         first_token_latency_ms=first_token_latency_ms,
         duration_ms=duration_ms,
-        remote_cost=0.0 if is_local else (reported_cost if cost_reported else None),
+        remote_cost=0.0 if is_local else (reported_cost if cost_usable else None),
         raw_metadata=metadata,
-        cost_unavailable=not is_local and not cost_reported,
+        cost_unavailable=not is_local and not cost_usable,
     )
     if failure_kind == "step_limit_reached":
         raise InvocationIncompleteError(

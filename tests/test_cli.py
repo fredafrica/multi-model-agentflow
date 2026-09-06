@@ -158,6 +158,24 @@ class CliTests(unittest.TestCase):
         self.assertEqual(1, tests)
         self.assertEqual(1, reviews)
 
+    def test_cancel_rejects_completed_run_without_changing_state(self) -> None:
+        code, _, _ = self.call("plan", "authorize", "--hash", plan_hash(self.plan))
+        self.assertEqual(0, code)
+        code, _, error = self.call("start", "cli-plan", "--run-id", "cancel-guard-run")
+        self.assertEqual(0, code, error)
+        code, _, error = self.call("cancel", "cancel-guard-run")
+        self.assertEqual(2, code)
+        self.assertIn("cannot be cancelled", error)
+        database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        database.initialize()
+        try:
+            self.assertEqual(
+                "completed",
+                database.run_snapshot("cancel-guard-run")["run"]["run_state"],
+            )
+        finally:
+            database.close()
+
     def test_immediate_pause_and_cancel_terminate_active_opencode_group(self) -> None:
         for action, expected_run_state in (
             ("cancel", "cancelled"),
@@ -232,6 +250,33 @@ class CliTests(unittest.TestCase):
                 finally:
                     connection.close()
                 self.assertEqual("unknown", state)
+
+    def test_immediate_pause_records_supervisor_notification(self) -> None:
+        code, _, error = self.call("plan", "authorize", "--hash", plan_hash(self.plan))
+        self.assertEqual(0, code, error)
+        database = Database(self.root / ".agentflow" / "runs" / "agentflow.db")
+        database.initialize()
+        try:
+            authorization = database.latest_authorization(
+                self.plan.plan_id, self.plan.version
+            )
+            database.create_run("freeze-notify-run", self.plan, authorization)
+        finally:
+            database.close()
+        code, output, error = self.call("pause", "freeze-notify-run", "--immediate")
+        self.assertEqual(0, code, error)
+        self.assertEqual("paused", json.loads(output)["run"]["run_state"])
+        connection = sqlite3.connect(
+            self.root / ".agentflow" / "runs" / "agentflow.db"
+        )
+        try:
+            rows = connection.execute(
+                "SELECT reason FROM supervisor_checkpoints WHERE run_id = ?",
+                ("freeze-notify-run",),
+            ).fetchall()
+        finally:
+            connection.close()
+        self.assertEqual(["run_paused"], [row[0] for row in rows])
 
     def test_plan_show_includes_implementation_timeout(self) -> None:
         code, output, _ = self.call("plan", "show")

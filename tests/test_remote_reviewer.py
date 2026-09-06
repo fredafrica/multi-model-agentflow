@@ -262,7 +262,7 @@ class RemoteAdapterTests(unittest.TestCase):
         self.assertEqual(0, local.remote_cost)
         self.assertFalse(local.cost_unavailable)
 
-    def test_interrupted_remote_process_is_unknown_and_not_retried(self) -> None:
+    def test_timeout_remote_process_is_unknown_with_reason_and_not_retried(self) -> None:
         discovery = subprocess.CompletedProcess(
             ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
         )
@@ -289,6 +289,34 @@ class RemoteAdapterTests(unittest.TestCase):
         ) as popen, mock.patch(
             "agentflow.opencode_adapter.OpenCodeAdapter.cancel", return_value=True
         ):
+            with self.assertRaises(InvocationOutcomeUnknown) as raised:
+                adapter.invoke(review_request())
+        self.assertEqual(1, popen.call_count)
+        self.assertEqual("timeout", raised.exception.termination_reason)
+        self.assertIsNotNone(raised.exception.result)
+        self.assertTrue(raised.exception.result.cost_unavailable)
+
+    def test_interrupted_remote_process_is_unknown_and_not_retried(self) -> None:
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+
+        class InterruptedProcess:
+            pid = 41236
+            returncode = None
+
+            def communicate(self, timeout=None):
+                raise KeyboardInterrupt
+
+        process = InterruptedProcess()
+        adapter = RemoteOpenCodeReviewerAdapter(
+            PROVIDER, opencode_command="stub", timeout_seconds=1
+        )
+        with mock.patch("subprocess.run", return_value=discovery), mock.patch(
+            "subprocess.Popen", return_value=process
+        ) as popen, mock.patch(
+            "agentflow.opencode_adapter.OpenCodeAdapter.cancel", return_value=True
+        ), mock.patch("agentflow.opencode_adapter._bounded_drain", return_value=b""):
             with self.assertRaisesRegex(InvocationOutcomeUnknown, "outcome unknown"):
                 adapter.invoke(review_request())
         self.assertEqual(1, popen.call_count)
@@ -333,7 +361,7 @@ class RemoteAdapterTests(unittest.TestCase):
         self.assertEqual(0.125, result.remote_cost)
         self.assertFalse(result.cost_unavailable)
 
-    def test_nonzero_exit_without_step_limit_signal_is_model_unavailable(self) -> None:
+    def test_nonzero_exit_without_step_limit_signal_is_protocol_error(self) -> None:
         discovery = subprocess.CompletedProcess(
             ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
         )
@@ -352,8 +380,74 @@ class RemoteAdapterTests(unittest.TestCase):
         with mock.patch("subprocess.run", return_value=discovery), mock.patch(
             "subprocess.Popen", return_value=NonZeroProcess()
         ):
-            with self.assertRaises(ModelUnavailableError):
+            with self.assertRaises(ReviewerProtocolError):
                 adapter.invoke(review_request())
+
+    def test_nonzero_exit_reviewer_preserves_confirmed_usage_and_cost(self) -> None:
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+        stdout = json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "sess-usage",
+                "part": {"tokens": {"input": 17, "output": 9}, "cost": 0.125},
+            }
+        )
+
+        class NonZeroProcess:
+            pid = 41241
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return stdout, "model unavailable"
+
+        adapter = RemoteOpenCodeReviewerAdapter(PROVIDER, opencode_command="stub")
+        with mock.patch("subprocess.run", return_value=discovery), mock.patch(
+            "subprocess.Popen", return_value=NonZeroProcess()
+        ):
+            with self.assertRaises(ReviewerProtocolError) as raised:
+                adapter.invoke(review_request())
+        result = raised.exception.result
+        self.assertIsNotNone(result)
+        self.assertEqual((17, 9), (result.input_tokens, result.output_tokens))
+        self.assertEqual("sess-usage", result.provider_request_id)
+        self.assertEqual(0.125, result.remote_cost)
+        self.assertFalse(result.cost_unavailable)
+        self.assertEqual("nonzero_exit", result.raw_metadata["termination_reason"])
+
+    def test_no_text_but_usage_reviewer_preserves_tokens(self) -> None:
+        discovery = subprocess.CompletedProcess(
+            ("stub",), 0, stdout=f"{PROVIDER}/{MODEL_ID}\n", stderr=""
+        )
+        stdout = json.dumps(
+            {
+                "type": "step_finish",
+                "sessionID": "sess-no-text",
+                "part": {"tokens": {"input": 5, "output": 3}},
+            }
+        )
+
+        class NonZeroProcess:
+            pid = 41242
+            returncode = 1
+
+            def communicate(self, timeout=None):
+                return stdout, "model unavailable"
+
+        adapter = RemoteOpenCodeReviewerAdapter(PROVIDER, opencode_command="stub")
+        with mock.patch("subprocess.run", return_value=discovery), mock.patch(
+            "subprocess.Popen", return_value=NonZeroProcess()
+        ):
+            with self.assertRaises(ReviewerProtocolError) as raised:
+                adapter.invoke(review_request())
+        result = raised.exception.result
+        self.assertIsNotNone(result)
+        self.assertEqual((5, 3), (result.input_tokens, result.output_tokens))
+        self.assertEqual("sess-no-text", result.provider_request_id)
+        self.assertIsNone(result.remote_cost)
+        self.assertTrue(result.cost_unavailable)
+        self.assertEqual("opencode_json_events", result.raw_metadata["token_source"])
 
 
 class RemotePolicyTests(unittest.TestCase):
@@ -563,6 +657,7 @@ class ReviewPacketTests(unittest.TestCase):
                 "diff",
                 "deterministic_test",
                 "evidence_excerpts",
+                "input_artifacts",
                 "review_questions",
                 "expected_response",
             },
@@ -588,6 +683,41 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertIn("do not use a markdown code fence", protocol)
         self.assertIn("approved (boolean)", protocol)
         self.assertIn("findings (array)", protocol)
+
+    def test_remote_review_with_unavailable_cost_wakes_supervisor(self) -> None:
+        task = remote_task()
+        plan = remote_plan(task)
+
+        def remote_review(request: InvocationRequest) -> InvocationResult:
+            return InvocationResult(
+                "stub-session",
+                json.dumps({"approved": True, "findings": []}),
+                7,
+                3,
+                1,
+                2,
+                None,
+                {"test_double": True},
+            )
+
+        local = FakeAdapter(
+            responder=lambda request: InvocationResult(
+                "fake-local", "implementation complete", 0, 0, 0, 0, 0,
+                {"test_double": True}
+            )
+        )
+        remote = FakeAdapter(responder=remote_review)
+        result = Runner(
+            self.database,
+            AdapterRouter({"fake": local, PROVIDER: remote}),
+            self.workspace,
+        ).start(plan, issue_authorization(plan), run_id="cost-wake-run")
+        self.assertEqual("completed", result.state.value)
+        reasons = [
+            checkpoint["reason"]
+            for checkpoint in self.database.pending_supervisor_checkpoints("cost-wake-run")
+        ]
+        self.assertIn("cost_unavailable", reasons)
 
     def test_untracked_planned_output_enters_scope_packet_and_snapshot_stays_stable(self) -> None:
         relative = "outputs/new-result.txt"
@@ -853,7 +983,7 @@ class ReviewPacketTests(unittest.TestCase):
             self.workspace,
         ).start(plan, issue_authorization(plan), run_id="quoted-step-limit-run")
 
-        self.assertEqual("failed", result.state.value)
+        self.assertEqual("paused", result.state.value)
         review = self.database.fetch_one(
             "SELECT approved, findings_json FROM reviews WHERE run_id = ?",
             ("quoted-step-limit-run",),

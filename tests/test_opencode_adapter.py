@@ -51,6 +51,29 @@ class _TimingOutProcess:
         return self.remaining, ""
 
 
+class _KillFailingProcess:
+    pid = 41234
+
+    def __init__(self, partial_output: bytes, drain_output: bytes) -> None:
+        self.partial_output = partial_output
+        self.drain_output = drain_output
+        self.returncode = None
+        self.timeout_args: list[int | None] = []
+        self.communicate_calls = 0
+
+    def communicate(self, timeout: int | None = None) -> tuple[bytes, str]:
+        self.communicate_calls += 1
+        self.timeout_args.append(timeout)
+        raise subprocess.TimeoutExpired(
+            ("opencode", "run"),
+            timeout or 0,
+            output=self.partial_output if self.communicate_calls == 1 else self.drain_output,
+        )
+
+    def kill(self) -> None:
+        raise OSError("kill failed")
+
+
 def _local_request(worktree: Path) -> InvocationRequest:
     return InvocationRequest(
         call_id="call-1",
@@ -1119,7 +1142,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
                     adapter.invoke(request)
         error = raised.exception
         self.assertEqual("local-process-group:41234", error.provider_request_id)
-        self.assertEqual([120, None], process.timeout_args)
+        self.assertEqual([120, 5.0], process.timeout_args)
         result = error.result
         self.assertIsNotNone(result)
         self.assertEqual("", result.output)
@@ -1131,6 +1154,38 @@ class OpenCodeAdapterTests(unittest.TestCase):
         self.assertEqual("opencode_json_events", result.raw_metadata["token_source"])
         self.assertEqual(0.0, result.remote_cost)
         self.assertFalse(result.cost_unavailable)
+
+    def test_drain_never_waits_without_timeout_when_kill_fails(self) -> None:
+        events = (
+            json.dumps({"type": "step_start", "sessionID": "sess-9", "part": {}}),
+            json.dumps(
+                {"type": "step_finish", "part": {"tokens": {"input": 17, "output": 9}}}
+            ),
+            json.dumps(
+                {"type": "step_finish", "part": {"tokens": {"input": 23, "output": 6}}}
+            ),
+        )
+        partial_bytes = ("\n".join(events) + "\n").encode("utf-8")
+        with tempfile.TemporaryDirectory() as directory:
+            request = self._timeout_request(
+                directory, {"implementation_timeout_seconds": 120}
+            )
+            process = _KillFailingProcess(partial_bytes, b"")
+            adapter = OpenCodeAdapter(opencode_command="opencode-stub")
+            with mock.patch("subprocess.Popen", return_value=process):
+                with self.assertRaises(InvocationOutcomeUnknown) as raised:
+                    adapter.invoke(request)
+        error = raised.exception
+        self.assertEqual("timeout", error.termination_reason)
+        result = error.result
+        self.assertIsNotNone(result)
+        self.assertEqual(3, process.communicate_calls)
+        for timeout_arg in process.timeout_args:
+            self.assertIsNotNone(timeout_arg)
+        self.assertEqual((40, 15), (result.input_tokens, result.output_tokens))
+        self.assertEqual("sess-9", result.provider_request_id)
+        self.assertTrue(result.raw_metadata["cleanup_incomplete"])
+        self.assertEqual("timeout", result.raw_metadata["termination_reason"])
 
     def test_timeout_identical_step_finish_events_are_counted_twice(self) -> None:
         step = json.dumps(

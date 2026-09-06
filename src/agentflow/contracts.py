@@ -2,12 +2,31 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from pathlib import PurePath
+from pathlib import PurePosixPath
 from typing import Any, Mapping
+
+
+def _normalized_relative(path: str) -> str:
+    """Return a canonical project-relative POSIX path, rejecting escapes.
+
+    ``.``, ``//``, and redundant components are collapsed so that ``./a``,
+    ``a/./b``, and ``a//b`` all compare equal to ``a`` / ``a/b``. Absolute
+    paths, parent escapes, and empty paths are rejected.
+    """
+    if not isinstance(path, str) or not path or "\x00" in path:
+        raise ValueError(f"task path must be a non-empty relative string: {path!r}")
+    pure = PurePosixPath(path)
+    if pure.is_absolute() or ".." in pure.parts:
+        raise ValueError(f"task path must be project-relative: {path}")
+    parts = [part for part in pure.parts if part not in ("", ".")]
+    if not parts:
+        raise ValueError(f"task path must be a non-empty relative string: {path!r}")
+    return "/".join(parts)
 
 
 class StringEnum(str, Enum):
@@ -77,6 +96,21 @@ class Severity(StringEnum):
     P3 = "P3"
 
 
+class RemoteNetworkMode(StringEnum):
+    DENY = "deny"
+    ALLOWLIST = "allowlist"
+
+
+class ReviewAcceptancePolicy(StringEnum):
+    BLOCK_P0_P1 = "block_p0_p1"
+    ZERO_FINDINGS = "zero_findings"
+
+
+class SupervisorReasoningEffort(StringEnum):
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
 DEFAULT_IMPLEMENTATION_MAX_STEPS = 8
 IMPLEMENTATION_MAX_STEPS_LIMIT = 32
 
@@ -86,6 +120,136 @@ IMPLEMENTATION_TIMEOUT_SECONDS_LIMIT = 14400
 
 DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS = 0
 IMPLEMENTATION_MAX_CONTINUATIONS_LIMIT = 8
+
+DEFAULT_REMOTE_WORKER_MAX_STEPS = 32
+REMOTE_WORKER_MAX_STEPS_LIMIT = 128
+
+DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS = 900
+REMOTE_WORKER_TIMEOUT_SECONDS_MIN = 60
+REMOTE_WORKER_TIMEOUT_SECONDS_LIMIT = 14400
+
+# A single authorization may never outlive one day. Longer values in a plan are
+# rejected so that JSON loading and direct construction behave identically.
+AUTHORIZATION_TTL_SECONDS_LIMIT = 86_400
+
+DEFAULT_SUPERVISOR_MAX_CHECKPOINTS = 10
+SUPERVISOR_MAX_CHECKPOINTS_LIMIT = 100
+
+# Stable reason code for the single bounded sentinel checkpoint recorded when
+# the per-run supervisor checkpoint limit is reached. The sentinel carries the
+# dropped reason so the external Supervisor still sees a pending marker.
+SUPERVISOR_CHECKPOINT_LIMIT_SENTINEL_REASON = "checkpoint_limit_reached"
+
+DEFAULT_SUPERVISOR_MAX_CHECKPOINT_CHARS = 6000
+SUPERVISOR_MAX_CHECKPOINT_CHARS_MIN = 1000
+SUPERVISOR_MAX_CHECKPOINT_CHARS_LIMIT = 60000
+
+# Stable, generic reason codes surfaced to the external Supervisor. They are
+# business-neutral and only reference the actual Review/Test/state evidence.
+SUPERVISOR_WAKE_EVENTS: frozenset[str] = frozenset(
+    {
+        "acceptance_unmet",
+        "review_retries_exhausted",
+        "external_evidence_unavailable",
+        "unknown_call",
+        "p0_p1_finding",
+        "privacy_violation",
+        "scope_violation",
+        "authorization_violation",
+        "network_violation",
+        "budget_threshold",
+        "cost_unavailable",
+        "timeout",
+        "signal_terminated",
+        "session_mismatch",
+        "continuation_exhausted",
+        "reviewer_unavailable",
+        "reviewer_protocol_error",
+        "owner_decision_required",
+        "run_completed",
+        "run_failed",
+        "run_cancelled",
+        "run_paused",
+        "checkpoint_limit_reached",
+    }
+)
+
+# Reasons that must always wake the external Supervisor. These cannot be
+# silenced by an empty (or narrow) `wake_events` configuration; the
+# `wake_events` list may only add optional reasons on top of this set.
+SUPERVISOR_MANDATORY_WAKE_EVENTS: frozenset[str] = frozenset(
+    {
+        "unknown_call",
+        "p0_p1_finding",
+        "privacy_violation",
+        "scope_violation",
+        "authorization_violation",
+        "network_violation",
+        "budget_threshold",
+        "cost_unavailable",
+        "timeout",
+        "signal_terminated",
+        "session_mismatch",
+        "continuation_exhausted",
+        "reviewer_unavailable",
+        "reviewer_protocol_error",
+        "owner_decision_required",
+        "review_retries_exhausted",
+        "run_completed",
+        "run_failed",
+        "run_cancelled",
+        "run_paused",
+        "checkpoint_limit_reached",
+    }
+)
+
+# Reasons that require the escalated (high) supervisor reasoning effort rather
+# than the default effort.
+SUPERVISOR_ESCALATED_REASONS: frozenset[str] = frozenset(
+    {
+        "p0_p1_finding",
+        "privacy_violation",
+        "scope_violation",
+        "authorization_violation",
+        "network_violation",
+        "unknown_call",
+        "cost_unavailable",
+        "budget_threshold",
+        "timeout",
+        "signal_terminated",
+        "session_mismatch",
+        "reviewer_unavailable",
+        "reviewer_protocol_error",
+        "review_retries_exhausted",
+        "run_failed",
+        "checkpoint_limit_reached",
+    }
+)
+
+# Canonical mapping from the runner's internal pause reasons to the stable,
+# business-neutral supervisor wake reason codes in ``SUPERVISOR_WAKE_EVENTS``.
+# Only reasons that must wake the external Supervisor are listed here; a pause
+# reason without a mapping (for example a user-requested ``pause_requested``)
+# still records ``run_paused`` but not a specific wake reason.
+SUPERVISOR_PAUSE_REASON_CODES: dict[str, str] = {
+    "unknown_model_call": "unknown_call",
+    "session_mismatch": "session_mismatch",
+    "suspected_step_limit": "continuation_exhausted",
+    "review_step_limit_reached": "continuation_exhausted",
+    "implementation_step_limit_reached": "continuation_exhausted",
+    "reviewer_output_invalid": "reviewer_protocol_error",
+    "reviewer_unavailable": "reviewer_unavailable",
+    "confirmation_required": "owner_decision_required",
+    "policy_denied": "authorization_violation",
+}
+
+# Canonical mapping from an adapter's raw termination reason to the stable,
+# business-neutral supervisor wake reason code. An unrecognized termination
+# reason collapses to ``unknown_call`` (fail-closed, still mandatory).
+SUPERVISOR_TERMINATION_REASON_CODES: dict[str, str] = {
+    "timeout": "timeout",
+    "signal_terminated": "signal_terminated",
+}
 
 
 @dataclass(frozen=True)
@@ -136,6 +300,82 @@ class ModelRecord:
 
 
 @dataclass(frozen=True)
+class InputArtifact:
+    path: str
+    sha256: str
+
+    def __post_init__(self) -> None:
+        if not self.path or not isinstance(self.path, str):
+            raise ValueError("input artifact path is required")
+        if not isinstance(self.sha256, str):
+            raise ValueError("input artifact sha256 must be a string")
+        _normalized_relative(self.path)
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", self.sha256):
+            raise ValueError(f"input artifact sha256 must be a 64-char hex digest: {self.sha256}")
+        object.__setattr__(self, "sha256", self.sha256.lower())
+
+
+@dataclass(frozen=True)
+class SupervisorPolicy:
+    default_reasoning_effort: SupervisorReasoningEffort = (
+        SupervisorReasoningEffort.MEDIUM
+    )
+    escalated_reasoning_effort: SupervisorReasoningEffort = (
+        SupervisorReasoningEffort.HIGH
+    )
+    max_supervisor_checkpoints: int = DEFAULT_SUPERVISOR_MAX_CHECKPOINTS
+    max_checkpoint_chars: int = DEFAULT_SUPERVISOR_MAX_CHECKPOINT_CHARS
+    wake_events: tuple[str, ...] = ()
+    continuous_llm_monitoring: bool = False
+    supervisor_model_hint: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "default_reasoning_effort",
+            SupervisorReasoningEffort(self.default_reasoning_effort),
+        )
+        object.__setattr__(
+            self,
+            "escalated_reasoning_effort",
+            SupervisorReasoningEffort(self.escalated_reasoning_effort),
+        )
+        object.__setattr__(
+            self,
+            "max_supervisor_checkpoints",
+            _coerce_range(
+                self.max_supervisor_checkpoints,
+                1,
+                SUPERVISOR_MAX_CHECKPOINTS_LIMIT,
+                "max_supervisor_checkpoints",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "max_checkpoint_chars",
+            _coerce_range(
+                self.max_checkpoint_chars,
+                SUPERVISOR_MAX_CHECKPOINT_CHARS_MIN,
+                SUPERVISOR_MAX_CHECKPOINT_CHARS_LIMIT,
+                "max_checkpoint_chars",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "continuous_llm_monitoring",
+            _require_bool(self.continuous_llm_monitoring, "continuous_llm_monitoring"),
+        )
+        object.__setattr__(
+            self, "wake_events", _require_str_tuple(self.wake_events, "wake_events")
+        )
+        if self.continuous_llm_monitoring:
+            raise ValueError("continuous LLM monitoring is not supported in the MVP")
+        if self.supervisor_model_hint is not None:
+            if not isinstance(self.supervisor_model_hint, str) or not self.supervisor_model_hint.strip():
+                raise ValueError("supervisor_model_hint must be a non-empty string or null")
+
+
+@dataclass(frozen=True)
 class TaskContract:
     task_id: str
     objective: str
@@ -156,10 +396,34 @@ class TaskContract:
     implementation_max_steps: int = DEFAULT_IMPLEMENTATION_MAX_STEPS
     implementation_timeout_seconds: int = DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
     implementation_max_continuations: int = DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS
+    allow_remote_implementation: bool = False
+    remote_worker_network_mode: RemoteNetworkMode = RemoteNetworkMode.DENY
+    remote_worker_allowed_hosts: tuple[str, ...] = ()
+    remote_worker_max_steps: int = DEFAULT_REMOTE_WORKER_MAX_STEPS
+    remote_worker_timeout_seconds: int = DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS
+    input_artifacts: tuple[InputArtifact, ...] = ()
+    review_acceptance_policy: ReviewAcceptancePolicy = ReviewAcceptancePolicy.BLOCK_P0_P1
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "max_remote_cost", float(self.max_remote_cost))
+        object.__setattr__(
+            self, "max_remote_cost", _coerce_money(self.max_remote_cost, "max_remote_cost")
+        )
         object.__setattr__(self, "max_retry_count", int(self.max_retry_count))
+        object.__setattr__(
+            self,
+            "allow_remote_implementation",
+            _require_bool(self.allow_remote_implementation, "allow_remote_implementation"),
+        )
+        object.__setattr__(
+            self,
+            "remote_worker_network_mode",
+            RemoteNetworkMode(self.remote_worker_network_mode),
+        )
+        object.__setattr__(
+            self,
+            "review_acceptance_policy",
+            ReviewAcceptancePolicy(self.review_acceptance_policy),
+        )
         object.__setattr__(
             self, "implementation_max_steps", _coerce_step_budget(self.implementation_max_steps)
         )
@@ -173,18 +437,51 @@ class TaskContract:
             "implementation_max_continuations",
             _coerce_continuations(self.implementation_max_continuations),
         )
+        object.__setattr__(
+            self,
+            "remote_worker_max_steps",
+            _coerce_step_budget(
+                self.remote_worker_max_steps, upper_limit=REMOTE_WORKER_MAX_STEPS_LIMIT
+            ),
+        )
+        object.__setattr__(
+            self,
+            "remote_worker_timeout_seconds",
+            _coerce_timeout_seconds(self.remote_worker_timeout_seconds),
+        )
+        object.__setattr__(
+            self, "remote_worker_allowed_hosts", _require_str_tuple(
+                self.remote_worker_allowed_hosts, "remote_worker_allowed_hosts"
+            )
+        )
+        object.__setattr__(
+            self, "input_artifacts", _require_artifact_tuple(
+                self.input_artifacts, "input_artifacts"
+            )
+        )
         if not self.task_id or not self.objective:
             raise ValueError("task_id and objective are required")
-        if self.max_remote_cost < 0 or self.max_retry_count < 0:
-            raise ValueError("cost and retry limits cannot be negative")
+        if self.max_retry_count < 0:
+            raise ValueError("retry limits cannot be negative")
         if not self.acceptance_criteria:
             raise ValueError("at least one acceptance criterion is required")
         for path in (*self.allowed_files, *self.expected_outputs):
-            pure = PurePath(path)
-            if pure.is_absolute() or ".." in pure.parts:
-                raise ValueError(f"task paths must be project-relative: {path}")
-        if not set(self.expected_outputs) <= set(self.allowed_files):
+            _normalized_relative(path)
+        allowed = {_normalized_relative(path) for path in self.allowed_files}
+        expected = {_normalized_relative(path) for path in self.expected_outputs}
+        if not expected <= allowed:
             raise ValueError("expected outputs must be included in allowed_files")
+        for host in self.remote_worker_allowed_hosts:
+            validate_hostname(host)
+        artifact_paths = [artifact.path for artifact in self.input_artifacts]
+        normalized_artifacts = [_normalized_relative(path) for path in artifact_paths]
+        if len(normalized_artifacts) != len(set(normalized_artifacts)):
+            raise ValueError("input artifact paths must be unique")
+        overlap = set(normalized_artifacts) & allowed
+        if overlap:
+            raise ValueError(
+                f"input artifacts must not overlap allowed_files: {sorted(overlap)}"
+            )
 
 
 @dataclass(frozen=True)
@@ -205,22 +502,27 @@ class PlanContract:
     critical_task_ids: tuple[str, ...] = ()
     allowed_provider_ids: tuple[str, ...] = ()
     authorization_ttl_seconds: int = 86_400
+    supervisor_policy: SupervisorPolicy = field(default_factory=SupervisorPolicy)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", int(self.schema_version))
         object.__setattr__(self, "version", int(self.version))
-        object.__setattr__(self, "max_remote_cost", float(self.max_remote_cost))
-        object.__setattr__(self, "emergency_reserve", float(self.emergency_reserve))
+        object.__setattr__(
+            self, "max_remote_cost", _coerce_money(self.max_remote_cost, "max_remote_cost")
+        )
+        object.__setattr__(
+            self, "emergency_reserve", _coerce_money(self.emergency_reserve, "emergency_reserve")
+        )
         object.__setattr__(self, "max_concurrency", int(self.max_concurrency))
-        object.__setattr__(self, "authorization_ttl_seconds", int(self.authorization_ttl_seconds))
+        object.__setattr__(
+            self,
+            "authorization_ttl_seconds",
+            _coerce_ttl_seconds(self.authorization_ttl_seconds),
+        )
         if self.schema_version < 1 or self.version < 1:
             raise ValueError("schema_version and version must be positive")
-        if self.max_remote_cost < 0 or self.emergency_reserve < 0:
-            raise ValueError("plan budgets cannot be negative")
         if self.max_concurrency < 1:
             raise ValueError("max_concurrency must be positive")
-        if self.authorization_ttl_seconds < 1:
-            raise ValueError("authorization_ttl_seconds must be positive")
         if not 1 <= len(self.tasks) <= 4:
             raise ValueError("an MVP plan must contain one to four tasks")
         task_ids = [task.task_id for task in self.tasks]
@@ -267,6 +569,9 @@ class PlanContract:
         unknown_critical = set(self.critical_task_ids) - set(task_ids)
         if unknown_critical:
             raise ValueError(f"unknown critical task IDs: {unknown_critical}")
+        unknown_wake_events = set(self.supervisor_policy.wake_events) - SUPERVISOR_WAKE_EVENTS
+        if unknown_wake_events:
+            raise ValueError(f"unknown supervisor wake events: {unknown_wake_events}")
 
     @property
     def provider_ids(self) -> tuple[str, ...]:
@@ -334,8 +639,14 @@ class InvocationResult:
     cost_unavailable: bool = False
 
     def __post_init__(self) -> None:
-        if self.remote_cost is not None and self.remote_cost < 0:
-            raise ValueError("reported cost cannot be negative")
+        if self.remote_cost is not None:
+            if isinstance(self.remote_cost, bool) or not isinstance(
+                self.remote_cost, (int, float)
+            ):
+                raise ValueError("reported cost must be a non-negative finite number")
+            if not math.isfinite(float(self.remote_cost)) or self.remote_cost < 0:
+                raise ValueError("reported cost must be a non-negative finite number")
+            object.__setattr__(self, "remote_cost", float(self.remote_cost))
         if self.remote_cost is not None and self.cost_unavailable:
             raise ValueError("reported cost cannot also be unavailable")
         if self.remote_cost is None and not self.cost_unavailable:
@@ -374,20 +685,51 @@ class ReviewResult:
             raise ValueError("P0/P1 findings prevent approval")
 
 
-def _coerce_step_budget(value: Any) -> int:
-    if isinstance(value, bool):
-        raise ValueError("implementation_max_steps must be a positive integer")
-    if isinstance(value, float):
-        if not value.is_integer():
-            raise ValueError("implementation_max_steps must be a positive integer")
-        value = int(value)
-    if not isinstance(value, int):
-        raise ValueError("implementation_max_steps must be a positive integer")
-    if not 1 <= value <= IMPLEMENTATION_MAX_STEPS_LIMIT:
-        raise ValueError(
-            "implementation_max_steps must be between 1 and "
-            f"{IMPLEMENTATION_MAX_STEPS_LIMIT}"
-        )
+def _require_bool(value: Any, label: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{label} must be a boolean")
+    return value
+
+
+def _require_str(value: Any, label: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string")
+    return value
+
+
+def _require_str_tuple(value: Any, label: str) -> tuple[str, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{label} must be a list of strings")
+    for item in value:
+        if not isinstance(item, str):
+            raise ValueError(f"{label} must contain only strings")
+    return tuple(value)
+
+
+def _require_artifact_tuple(
+    value: Any, label: str
+) -> tuple[InputArtifact, ...]:
+    if isinstance(value, (str, bytes)) or not isinstance(value, (list, tuple)):
+        raise ValueError(f"{label} must be a list of input artifacts")
+    for item in value:
+        if not isinstance(item, InputArtifact):
+            raise ValueError(f"{label} must contain only input artifacts")
+    return tuple(value)
+
+
+def _coerce_step_budget(value: Any, *, upper_limit: int = IMPLEMENTATION_MAX_STEPS_LIMIT) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError("step budget must be a positive integer")
+    if not 1 <= value <= upper_limit:
+        raise ValueError(f"step budget must be between 1 and {upper_limit}")
+    return value
+
+
+def _coerce_range(value: Any, low: int, high: int, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer")
+    if not low <= value <= high:
+        raise ValueError(f"{label} must be between {low} and {high}")
     return value
 
 
@@ -420,8 +762,36 @@ def _coerce_continuations(value: Any) -> int:
     return value
 
 
+def _coerce_money(value: Any, label: str) -> float:
+    """Validate a monetary amount: finite, non-negative, and a real number.
+
+    Booleans and strings are rejected rather than silently coerced, so a JSON
+    document and a direct constructor call fail the same way. NaN and infinity
+    never pass, since they would defeat every downstream budget comparison.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label} must be a non-negative finite number")
+    number = float(value)
+    if not math.isfinite(number) or number < 0:
+        raise ValueError(f"{label} must be a non-negative finite number")
+    return number
+
+
+def _coerce_ttl_seconds(value: Any) -> int:
+    if isinstance(value, bool) or isinstance(value, float) or not isinstance(value, int):
+        raise ValueError("authorization_ttl_seconds must be an integer")
+    if not 1 <= value <= AUTHORIZATION_TTL_SECONDS_LIMIT:
+        raise ValueError(
+            "authorization_ttl_seconds must be between 1 and "
+            f"{AUTHORIZATION_TTL_SECONDS_LIMIT}"
+        )
+    return value
+
+
 _PROVIDER_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 _MODEL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:+/@-]{0,255}$")
+_HOSTNAME = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$")
+_HOST_LABEL = re.compile(r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
 
 
 def validate_provider_id(value: str) -> str:
@@ -433,4 +803,15 @@ def validate_provider_id(value: str) -> str:
 def validate_model_id(value: str) -> str:
     if not _MODEL_ID.fullmatch(value):
         raise ValueError(f"unsupported model identifier: {value!r}")
+    return value
+
+
+def validate_hostname(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError(f"unsupported hostname: {value!r}")
+    if not value or not _HOSTNAME.fullmatch(value):
+        raise ValueError(f"unsupported hostname: {value!r}")
+    for label in value.split("."):
+        if not _HOST_LABEL.fullmatch(label):
+            raise ValueError(f"unsupported hostname: {value!r}")
     return value

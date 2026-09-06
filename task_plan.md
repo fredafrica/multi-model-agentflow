@@ -6,11 +6,11 @@
 
 ## Current Phase
 
-里程碑 18 `REVIEW_PASSED`：修复真实 OpenCode 同行“步骤耗尽 + Markdown 摘要引导语”的识别，对未知后缀采用可审计的安全暂停，并统一所有合法裸标记变体和词边界。Codex 独立复核并补充句点无空格的后缀边界；193 项测试、compileall、修改文件 Ruff 和 `git diff --check` 通过。
+里程碑 19 主体实现完成，正在修复 Codex 独立验收（`CHANGES_REQUIRED`）提出的 P0/P1/P2 项：最小临时沙箱、严格类型校验、真实输入快照、远程超时审计、完整主管协议、增量 `status --watch`、角色感知 fallback 路由与文档修正。当前全套 239 项测试通过；本轮不调用真实模型、不启动子 Agent、不产生 API 费用、不创建 commit。
 
 ## Next Step
 
-核对 Market Intelligence Platform 现有 TASK-011 AgentFlow 计划哈希与历史授权；若与用户已批准的哈希完全一致，则使用本地 Qwen 3.8 27B 8-bit 新建真实长 Markdown 续接验证运行；任何计划变化都要重新展示哈希。
+完成剩余文档修正后，同步 canonical/installed Skill、离线构建 wheel 并在干净隔离环境安装验证；最终复核 `findings.md`/`progress.md` SHA-256 未变化。
 
 ## Milestones
 
@@ -196,6 +196,20 @@
 - [x] 修复 `reachedness`/`reached123`/`reached_value` 词边界误报，并补充句点已构成边界但后缀无空格的疑似路径
 - [x] `terminal_reason` 明确为最后一个带 reason 的 `step_finish`；新增真实脱敏 fixture 与 parser/Runner 回归
 - [x] Codex 独立运行 193 项测试、compileall、修改文件 Ruff 与 `git diff --check`，未发现剩余 P0/P1
+
+### 里程碑 19：远程 Worker、显式输入快照、审核接受策略与低 Token 主管协议
+
+**Status:** in progress
+
+- [x] 合同新增 `RemoteNetworkMode`/`ReviewAcceptancePolicy`/`SupervisorReasoningEffort` 枚举、`InputArtifact`、`SupervisorPolicy`，以及 `TaskContract`（`allow_remote_implementation`、`remote_worker_network_mode`、`remote_worker_allowed_hosts`、`remote_worker_max_steps`、`remote_worker_timeout_seconds`、`input_artifacts`、`review_acceptance_policy`）与 `PlanContract.supervisor_policy` 字段，全部进入规范化 JSON 与计划哈希并严格校验（拒绝字符串布尔、布尔/浮点整数、非字符串 host/path/hash）
+- [x] 实现 `RemoteOpenCodeWorkerAdapter`（远程 implementation/revision，写权限 + 全网络/子代理禁用，步骤耗尽暂停且不续接，超时 `UNKNOWN` 并复用本地字节合并/partial usage，远程成本记 unavailable），与 Reviewer 共享 `_discover_remote_model_ids` 发现助手
+- [x] Runner 将远程 Worker 路由到最小临时沙箱（仅含哈希校验只读输入、允许文件与生成简报），输出全有或全无同步回工作树，并记录 `input_artifact.snapshotted` 事件；Reviewer 保持 packet-only 只读隔离
+- [x] `invocation_decision` 放行已授权的远程 implementation/revision，网络 `ALLOWLIST` 模式失败关闭；纯函数 `network_decision` 单独承载白名单语义
+- [x] `_parse_review` 按 `review_acceptance_policy`（`block_p0_p1`/`zero_findings`）确定性判定批准；P0/P1 finding 写入 checkpoint + 安全暂停且不修订，P2/P3 在 `zero_findings` 下自动修订、重试耗尽前不唤醒
+- [x] `supervisor_checkpoints` 表与完整主管协议：强制唤醒事件不可被空 `wake_events` 静默、`reasoning_effort`/`plan_hash`/`event_sequence`/`terminal` 列、终局 checkpoint 恰好一次且幂等、`max_supervisor_checkpoints` 同事务强制执行、有界 digest 保留 reason/预算/范围/plan hash/cursor 且 `original_bytes` 为真实 UTF-8 字节数
+- [x] CLI 新增 `supervisor-next`（`--after-sequence`/`--wait-seconds`，仅轮询本地库）与 `supervisor-record`（校验 plan hash/cursor/决策 schema、幂等重复、冲突拒绝、不得扩大授权/恢复 UNKNOWN/更改 plan）；`status --watch` 首次全量、后续仅在状态或事件序列变化时输出；`_runner` 按 provider+role 注册 Worker/Reviewer 适配器（不再误报同 provider 双角色）
+- [x] 远程 Worker 超时/中断持久化部分 stdout 字节与 SHA、时长、session ID、`termination_reason=timeout`
+- [x] 新增/修订回归测试（严格类型、沙箱隔离、全有或全无、输入快照事件、终局幂等、上限强制、supervisor-record 校验、digest 截断），全套 239 项通过；`git diff --check` 与 compileall 通过
 
 ## Decisions Made
 

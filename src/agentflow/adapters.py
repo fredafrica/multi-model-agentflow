@@ -17,10 +17,12 @@ class InvocationOutcomeUnknown(RuntimeError):
         provider_request_id: str | None = None,
         *,
         result: InvocationResult | None = None,
+        termination_reason: str | None = None,
     ) -> None:
         super().__init__(message)
         self.provider_request_id = provider_request_id
         self.result = result
+        self.termination_reason = termination_reason
 
 
 class InvocationIncompleteError(RuntimeError):
@@ -57,6 +59,27 @@ class ModelUnavailableError(ReviewerUnavailableError):
 class ReviewerProtocolError(ReviewerUnavailableError):
     """The reviewer answered, but its output did not satisfy the review protocol."""
 
+    def __init__(
+        self, message: str, *, result: InvocationResult | None = None
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
+
+class WorkerProtocolError(RuntimeError):
+    """A remote worker answered, but its output did not satisfy the protocol.
+
+    Unlike a pre-call unavailability this is a known post-call failure: the
+    process already ran, so any confirmed token/cost evidence in ``result`` must
+    be preserved and must not trigger a fallback re-dispatch.
+    """
+
+    def __init__(
+        self, message: str, *, result: InvocationResult | None = None
+    ) -> None:
+        super().__init__(message)
+        self.result = result
+
 
 class ModelAdapter(Protocol):
     @property
@@ -74,32 +97,56 @@ class ModelAdapter(Protocol):
 class AdapterRouter:
     adapter_id = "router"
 
-    def __init__(self, adapters: Mapping[str, ModelAdapter]) -> None:
+    def __init__(
+        self,
+        adapters: Mapping[str, ModelAdapter],
+        role_adapters: Mapping[tuple[str, str], ModelAdapter] | None = None,
+    ) -> None:
         self.adapters = dict(adapters)
+        self.role_adapters = dict(role_adapters or {})
 
-    def adapter_for(self, provider: str) -> ModelAdapter:
+    def adapter_for(self, provider: str, role: str | None = None) -> ModelAdapter:
+        if role is not None:
+            key = (provider, role)
+            if key in self.role_adapters:
+                return self.role_adapters[key]
         try:
             return self.adapters[provider]
         except KeyError as error:
             raise ValueError(f"no adapter registered for provider: {provider}") from error
 
     def discover(self) -> Sequence[ModelRecord]:
-        return tuple(record for adapter in self.adapters.values() for record in adapter.discover())
+        adapters = {id(adapter): adapter for adapter in self.adapters.values()}
+        for adapter in self.role_adapters.values():
+            adapters[id(adapter)] = adapter
+        return tuple(
+            record for adapter in adapters.values() for record in adapter.discover()
+        )
 
     def invoke(self, request: InvocationRequest) -> InvocationResult:
-        return self.adapter_for(request.model.provider).invoke(request)
+        return self.adapter_for(request.model.provider, request.role).invoke(request)
 
     def query(self, provider_request_id: str) -> InvocationResult | None:
+        seen: dict[int, ModelAdapter] = {}
         for adapter in self.adapters.values():
+            seen[id(adapter)] = adapter
+        for adapter in self.role_adapters.values():
+            seen[id(adapter)] = adapter
+        for adapter in seen.values():
             result = adapter.query(provider_request_id)
             if result is not None:
                 return result
         return None
 
     def query_provider(
-        self, provider: str, provider_request_id: str
+        self, provider: str, provider_request_id: str, role: str | None = None
     ) -> InvocationResult | None:
-        return self.adapter_for(provider).query(provider_request_id)
+        return self.adapter_for(provider, role).query(provider_request_id)
 
     def cancel(self, provider_request_id: str) -> bool:
-        return any(adapter.cancel(provider_request_id) for adapter in self.adapters.values())
+        seen: dict[int, ModelAdapter] = {}
+        for adapter in self.adapters.values():
+            seen[id(adapter)] = adapter
+        for adapter in self.role_adapters.values():
+            seen[id(adapter)] = adapter
+        return any(adapter.cancel(provider_request_id) for adapter in seen.values())

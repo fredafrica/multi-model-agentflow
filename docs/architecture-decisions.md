@@ -225,6 +225,32 @@
 - 影响：续接不是“自动重试”，而是同一会话内延续未完成工作；QA-08 的“不得自动重试”语义不变。多轮修订由 `max_retry_count` 驱动（impl→test→fix→retest），修订提示词携带返回码、stdout/stderr 尾部、缺失输出、未跟踪空白错误、changed files 与剩余验收条件的有界证据；修订角色同样在限额内续接。
 - 实现硬化（P1）：续接子调用必须确定性复用产生父 segment 的实际模型（含回退模型），而非默认 implementation_model；OpenCode 返回的会话 ID 必须与请求复用的 `--session` 完全一致，不一致视为协议错误，记录 `failure_kind=session_mismatch` 并安全暂停，绝不续接测试或审核。`continuation.scheduled` 事件与子调用登记在同一事务内原子写入；进程在“登记后、启动前”崩溃时遗留的 `PLANNED` 子调用按幂等 `request_key` 复用启动，而非死锁或重复登记。每个续接 segment 之前重新检查控制状态，非 `RUNNING` 时在安全边界暂停。
 
+### AD-41：远程 implementation/revision Worker
+
+- 状态：已接受（Owner 于 2026-09-05 明确要求）
+- 决策：在计划与授权快照明确允许时，AgentFlow 可以通过 OpenCode 调用计划指定的远程 provider/model 承担 `implementation`/`revision` 角色，由独立的 `RemoteOpenCodeWorkerAdapter` 执行；该角色仅在任务合同的 `allow_remote_implementation=true` 且 `remote_worker_network_mode` 可安全执行时放行。远程 Worker 拥有受限写权限（在授权 worktree 内编辑/写入），但 `bash`/`shell`/`external_directory`/`webfetch`/`websearch`/`task`/`subagent`/`skill`/`question` 全部禁用。
+- 网络门禁：OpenCode 权限层无法表达按主机白名单的 `webfetch`/`websearch`，因此 Worker 的权限配置始终拒绝网络，`ALLOWLIST` 模式在调用门禁处失败关闭（fail-closed），`DENY` 是唯一安全模式；纯函数 `network_decision` 单独承载白名单语义并独立测试。
+- 步骤预算与超时：远程 Worker 使用任务合同的 `remote_worker_max_steps`（缺省 32，1–128）与 `remote_worker_timeout_seconds`（缺省 900，60–14400），进入计划哈希与授权。远程 Worker 因步骤耗尽而失败时安全暂停，绝不续接（同会话续接仅限本地模型）；超时或结果不可确认保持 `UNKNOWN`。
+- 影响：该决定覆盖 AD-34 的“第一版远程仅 review/rereview”范围限制（Owner 明确扩大），但不放宽授权、D0-D3、预算、UNKNOWN、幂等、费用、文件或副作用规则，也不授权本次开发任务进行真实模型调用。远程只读 Reviewer 的权限与角色限制保持不变。
+
+### AD-42：显式输入快照
+
+- 状态：已接受（Owner 于 2026-09-05 明确要求）
+- 决策：任务合同新增 `input_artifacts`，为 `(path, sha256)` 元组列表，声明远程 Worker 执行前必须存在且内容哈希匹配的只读输入文件。每个 path 必须是项目相对路径且不得与 `allowed_files` 重叠，sha256 必须是 64 位十六进制；路径重复被拒绝。Runner 在驱动远程 Worker 前从项目根按哈希校验并原子复制输入到最小临时沙箱，记录 `input_artifact.snapshotted` 事件；执行后核验输入未被改动，并仅将 `allowed_files` 内的产物全有或全无同步回工作树。
+- 影响：远程 Worker 的输入状态被显式冻结为可审计快照；该字段进入计划哈希与授权，变化使旧授权失效。
+
+### AD-43：审核接受策略
+
+- 状态：已接受（Owner 于 2026-09-05 明确要求）
+- 决策：任务合同新增 `review_acceptance_policy` 枚举，`block_p0_p1`（缺省）沿用 P0/P1 阻断批准；`zero_findings` 要求审核零 findings（含 P2/P3）才批准。策略在解析审核结果时确定性应用，不能由审核输出覆盖。
+- 影响：为需要“无任何发现”的高质量门槛任务提供更严格的批准条件；缺省值保持向后兼容。
+
+### AD-44：低 Token 主管协议
+
+- 状态：已接受（Owner 于 2026-09-05 明确要求）
+- 决策：计划可新增可选 `supervisor_policy`（缺省 `wake_events` 为空），声明主管唤醒事件白名单、缺省/升级推理强度、检查点数量上限与单条内容字符上限，以及可选的主管模型提示 `supervisor_model_hint`（注册表数据，不硬编码模型名）；MVP 强制 `continuous_llm_monitoring=false`（持续 LLM 监控不支持）。控制平面在唤醒事件发生时写入独立的 `supervisor_checkpoints` 表，内容受 `max_checkpoint_chars` 约束截断为合法 JSON；`wake_events` 只能额外增加可选唤醒原因，一组强制唤醒事件（与 `SUPERVISOR_MANDATORY_WAKE_EVENTS` 一致）不可被空或窄 `wake_events` 静默。主管经 `agentflow supervisor-next --after-sequence N --wait-seconds S` 读取有界 digest（仅轮询本地库、无新事件超时输出 `{changed:false,wake_required:false,cursor}`），经 `agentflow supervisor-record` 记录并校验决策（plan hash、cursor、schema、幂等重复、冲突拒绝、不得扩大授权/恢复 UNKNOWN/更改 plan）；`supervisor_digest` 提供低 Token 摘要。唤醒事件均为确定性状态/审核/测试派生的事件，不使用高频模型调用轮询。
+- 影响：主管只被确定性事件唤醒，读取的是有界摘要而非完整日志；`checkpoint_json` 仍保留原语义，不承担主管摘要。强制唤醒事件清单与 `SUPERVISOR_MANDATORY_WAKE_EVENTS` 一致，均为业务无关的通用编码。
+
 ## 2. 原暂定、经实现验证后接受的决策
 
 ### AD-17：实现技术基线

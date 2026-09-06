@@ -1,6 +1,6 @@
 # 第一版 MVP
 
-状态：本地 MVP 已验收；OpenCode 远程只读 Reviewer 扩展已获授权并进入实现（2026-09-04）
+状态：本地 MVP 已验收；OpenCode 远程只读 Reviewer 与远程实现/修订 Worker 扩展已获授权并进入实现（2026-09-04）
 
 ## 1. MVP 目标
 
@@ -122,12 +122,16 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 | MVP-A25 | 实施产生计划内未跟踪新文件，包括带空白错误的样例。 | 新文件进入文件范围、Review Packet 和存在性检查；补充检查可在 `git diff --check` 单独退出 0 时捕获未跟踪空白错误。 | GIT-05~06 |
 | MVP-A26 | 本地实施调用超过任务合同配置的超时上限。 | 进程组被终止，调用记为 `UNKNOWN` 并暂停；数据库保存已确认 Token、耗时、会话 ID 与 `termination_reason=timeout`/`token_source`/`usage_unavailable`，`output_text` 为空，resume 被阻止且不自动重试；重叠或缺失的部分输出不重复累计 Token、不伪造零费用。 | TASK-05, QA-10, STATE-03, STATE-05 |
 | MVP-A27 | 本地实施调用反复步骤耗尽，且续接预算配置为 0、1 或 2。 | 预算为 0 时安全暂停且 resume 被阻止；预算 ≥1 时以 `--session` 在同一 OpenCode 会话内续接并最终完成，每个 segment 的 call/request_key/segment_index/continuation_of_call_id 唯一且单独记录 Token/耗时/费用；到达限额仍耗尽时暂停且 resume 不重复调用；远程 Reviewer、`UNKNOWN`、超时、signal、越界文件、缺失会话 ID 的场景不续接。 | TASK-06, QA-11, STATE-03, STATE-05 |
+| MVP-A28 | 以 stub OpenCode executable 执行远程 implementation/revision Worker。 | 参数使用数组并准确形成 `<provider>/<model-id>` 与授权 worktree `--dir`；角色、只读/写权限、provider/model 发现与网络禁用均在调用前验证；`bash`/`shell`/`external_directory`/`webfetch`/`websearch`/`task`/`subagent`/`skill`/`question` 全部拒绝。 | TASK-08, QA-07 |
+| MVP-A29 | 远程实施任务声明 `input_artifacts`，worktree 输入文件与哈希一致或不一致。 | 一致时 Worker 正常执行；任一文件缺失或哈希不一致时任务以 `input_artifact_mismatch` 失败，不进入模型调用。 | TASK-07 |
+| MVP-A30 | 同一审核输出在 `block_p0_p1` 与 `zero_findings` 两种 `review_acceptance_policy` 下分别评估。 | P2/P3 finding 在 `zero_findings` 下阻断批准，在 `block_p0_p1` 下不阻断；P0/P1 始终阻断。 | QA-12 |
+| MVP-A31 | 配置与未配置 `supervisor_policy` 唤醒事件，运行产生 P0/P1 finding 的任务。 | 配置时产生有界 `supervisor_checkpoints`，`supervisor-next` 读取、`supervisor-record` 确认、`supervisor_digest` 给出摘要且不调用模型；无论是否配置，一组强制唤醒事件（P0/P1 finding、UNKNOWN、超时/步骤/续接耗尽、会话不一致、范围/隐私/授权/网络违规、Reviewer 不可用/协议错误、费用未知、预算达限、终局等）始终被记录，空或窄 `wake_events` 只能额外增加可选唤醒原因，不能静默强制唤醒。 | CTRL-04, WAIT-02 |
 
 ## 5. MVP 完成定义
 
 同时满足以下条件才算 MVP 通过：
 
-1. MVP-A01 至 MVP-A27 全部通过，且每项有非模型自述的可核查证据。
+1. MVP-A01 至 MVP-A31 全部通过，且每项有非模型自述的可核查证据。
 2. 没有未解决的 P0/P1 审核问题。
 3. 通用核心没有硬编码候选模型或金融规则。
 4. 未包含“明确不做”列表中的能力作为隐含依赖。
@@ -144,7 +148,7 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 
 ## 7. 验收结果
 
-MVP-A01 至 MVP-A27 均已通过。当前自动化证据由 167 项标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider smoke test，远程费用为 0。历史本地适配器验证保持不变。
+MVP-A01 至 MVP-A31 均已通过。当前自动化证据由标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider smoke test，远程费用为 0。历史本地适配器验证保持不变。
 
 | 场景 | 结果 | 主要证据 |
 | --- | --- | --- |
@@ -175,3 +179,7 @@ MVP-A01 至 MVP-A27 均已通过。当前自动化证据由 167 项标准库测�
 | MVP-A25 | 通过 | 未跟踪文件范围、Review Packet、expected output 与补充空白错误测试 |
 | MVP-A26 | 通过 | 本地实施超时的进程组终止、`UNKNOWN` 持久化（Token/耗时/会话/termination_reason/token_source/usage_unavailable）、空 `output_text`、resume 阻止与重叠输出不重复计数测试 |
 | MVP-A27 | 通过 | 本地实施步骤耗尽的同会话分段续接、限额暂停、session 复用、越界/缺失会话/远程/UNKNOWN 不续接、segment 间进程重启只续接一次与多轮修订测试 |
+| MVP-A28 | 通过 | 远程 Worker 参数数组、`<provider>/<model-id>` 与 `--dir`、写权限 + 全网络/子代理禁用、角色/只读在发现前拒绝、步骤耗尽与超时分类测试 |
+| MVP-A29 | 通过 | 显式输入快照哈希一致放行、缺失或哈希不一致以 `input_artifact_mismatch` 失败且不进入模型调用测试 |
+| MVP-A30 | 通过 | `block_p0_p1` 与 `zero_findings` 两种策略下 P2/P3 阻断差异与 P0/P1 始终阻断测试 |
+| MVP-A31 | 通过 | `supervisor_checkpoints` 记录/读取/确认/摘要、内容截断、空/窄 `wake_events` 仍记录强制唤醒与 CLI `supervisor-next`/`supervisor-record` 测试 |

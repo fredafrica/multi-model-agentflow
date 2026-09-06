@@ -162,4 +162,57 @@ CREATE TABLE IF NOT EXISTS events (
 
 CREATE INDEX IF NOT EXISTS idx_events_aggregate
 ON events(aggregate_type, aggregate_id, sequence);
+
+CREATE TABLE IF NOT EXISTS supervisor_checkpoints (
+    checkpoint_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    reasoning_effort TEXT NOT NULL DEFAULT 'medium',
+    plan_hash TEXT,
+    event_sequence INTEGER NOT NULL DEFAULT 0,
+    terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal IN (0, 1)),
+    content_json TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'acknowledged')),
+    decision_json TEXT,
+    acknowledged_at TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id) REFERENCES runs(run_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_supervisor_checkpoints_run
+ON supervisor_checkpoints(run_id, sequence);
+
+CREATE TABLE IF NOT EXISTS input_artifact_snapshots (
+    snapshot_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    attempt_id TEXT NOT NULL,
+    path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL,
+    snapshot_at TEXT NOT NULL,
+    FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id),
+    FOREIGN KEY (attempt_id) REFERENCES attempts(attempt_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_input_artifact_snapshots_attempt
+ON input_artifact_snapshots(attempt_id);
+
+CREATE TABLE IF NOT EXISTS staging_syncs (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('created', 'synced')),
+    synced_files_json TEXT,
+    baseline_json TEXT,
+    manifest_json TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (attempt_id) REFERENCES attempts(attempt_id),
+    FOREIGN KEY (run_id, task_id) REFERENCES tasks(run_id, task_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_staging_syncs_run
+ON staging_syncs(run_id, task_id);
 """

@@ -28,7 +28,7 @@
 | PLAT-02 | Codex Skill 必须是第一版用户入口之一，并与 Terminal 共用同一套计划、状态和授权。 | 同一运行在 Skill 和 Terminal 中显示相同标识与状态。 |
 | PLAT-03 | 第一版在 macOS 开发和验证；核心任务格式、SQLite 数据及适配器接口应保持跨平台。 | 核心持久化不依赖 macOS 专属路径或 API；专属增强被隔离。 |
 | PLAT-04 | 第一版不开发网页控制台。 | MVP 交付清单中没有 Web UI。 |
-| PLAT-05 | AgentFlow 必须能通过 OpenCode 调用计划与授权快照共同限定的远程 provider/model，第一版远程能力只能执行独立、只读的 `review`/`rereview`，不得绕过控制平面或承担实施与修改。 | 使用 OpenCode 替身可观察到参数数组 `run --model <provider>/<model-id>`；未授权 provider、写入角色或非只读请求在进程启动前被确定性拒绝。 |
+| PLAT-05 | AgentFlow 必须能通过 OpenCode 调用计划与授权快照共同限定的远程 provider/model。远程 Reviewer 仅执行独立、只读的 `review`/`rereview`，不得绕过控制平面；远程 Worker 仅在任务合同显式允许（`allow_remote_implementation=true`）时承担 `implementation`/`revision`，并在最小临时沙箱内运行、网络默认拒绝。 | 使用 OpenCode 替身可观察到参数数组 `run --model <provider>/<model-id>`；未授权 provider、越界角色或非只读 Reviewer 请求在进程启动前被确定性拒绝。 |
 
 当前环境中的 Qwen 3.8 27B Q4、Qwen 3.8 27B 8-bit、GPT-OSS、DeepSeek V4 Flash 和 DeepSeek V4 Pro，以及未来可能采用的 GPT、Claude 或其他模型，均只视为用户提供的候选记录；名称、可用性和能力须在使用时发现或验证，不能成为通用 Skill 的永久默认值。
 
@@ -119,6 +119,13 @@ expected_outputs:
 implementation_max_steps:
 implementation_timeout_seconds:
 implementation_max_continuations:
+allow_remote_implementation:
+remote_worker_network_mode:
+remote_worker_allowed_hosts:
+remote_worker_max_steps:
+remote_worker_timeout_seconds:
+input_artifacts:
+review_acceptance_policy:
 ```
 
 其中 `risk_level` 是包含 `business_importance` 与 `operational_safety` 的对象，分别使用 AD-25 确定的 B0-B3 与 S0-S3 枚举。
@@ -131,6 +138,8 @@ implementation_max_continuations:
 | TASK-04 | 本地实施任务必须携带有限正整数步骤预算字段 `implementation_max_steps`，进入任务合同与计划哈希；旧计划未提供时默认 8，允许范围为 1–32。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务显式配置 12–16 等预算；越界、非整数或负值在构造/解析时被拒绝；改变预算后旧授权不能授权修改后的计划。 |
 | TASK-05 | 本地实施任务必须携带整数超时字段 `implementation_timeout_seconds`，进入任务合同与规范化 JSON/计划哈希；旧计划未提供时默认 900，允许范围为 60–14400。布尔、字符串、浮点数、0、负数及越界值在构造或解析时被拒绝。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务显式配置更长超时；`plan show` 展示该字段；越界或错误类型被拒绝；改变超时后旧授权不能授权修改后的计划。 |
 | TASK-06 | 本地实施任务必须携带非负整数续接预算字段 `implementation_max_continuations`，进入任务合同、规范化 JSON 与计划哈希；旧计划未提供时默认 0，允许范围为 0–8，0 表示步骤耗尽后不续接。布尔、字符串、非整型浮点、负数及越界值在构造或解析时被拒绝。修改该字段必须改变计划哈希并使旧授权失效。 | 复杂本地任务可显式配置续接次数；`plan show` 展示该字段；越界或错误类型被拒绝；改变续接预算后旧授权不能授权修改后的计划。 |
+| TASK-07 | 任务可携带显式输入快照 `input_artifacts`，为 `(path, sha256)` 元组列表，声明远程实施执行前必须存在且内容哈希匹配的只读输入文件。path 必须项目相对且不得与 `allowed_files` 重叠，sha256 必须是 64 位十六进制，路径不得重复；越界、绝对路径、非十六进制哈希、重复路径或与可写文件重叠在构造/解析时被拒绝。该字段进入规范化 JSON 与计划哈希。执行前将输入按哈希校验后原子复制到最小沙箱并记录 `input_artifact.snapshotted` 事件，执行后再次核验未被改动。 | 远程实施任务可声明输入快照；`plan show` 展示该字段；错误路径或哈希被拒绝；改变快照后旧授权不能授权修改后的计划。 |
+| TASK-08 | 远程 implementation/revision 任务必须由任务合同显式允许（`allow_remote_implementation=true`），且仅当 `remote_worker_network_mode` 可安全执行时放行；远程 Worker 在授权 worktree 内写，但 `bash`/`shell`/`external_directory`/`webfetch`/`websearch`/`task`/`subagent`/`skill`/`question` 全部禁用。远程 Worker 使用 `remote_worker_max_steps`（缺省 32，1–128）与 `remote_worker_timeout_seconds`（缺省 900，60–14400），进入计划哈希与授权；步骤耗尽安全暂停且不续接，超时或结果不可确认保持 `UNKNOWN`。 | 参数数组使用 `<provider>/<model-id>` 且权限配置禁用全部网络与子代理；未授权远程实施或 `ALLOWLIST` 网络模式在进程启动前被确定性拒绝；步骤耗尽暂停且 resume 不重复调用；越界预算/超时/哈希被拒绝。 |
 
 ## 10. 质量门禁
 
@@ -147,6 +156,7 @@ implementation_max_continuations:
 | QA-10 | 本地实施调用超过 `implementation_timeout_seconds` 时必须终止进程组并记为 `UNKNOWN`，不得自动进入自测、审核、重试或完成；必须保留部分 stdout 中已确认的 Token、耗时、OpenCode 会话 ID 及结构化审计元数据，同时诚实记录 `usage_unavailable` 与 `token_source`。部分输出不得当作可信 `output_text`；原始元数据只保存最小必要字段，并以 SHA-256 记录部分 stdout 哈希。 | 模拟超时后调用终态为 `UNKNOWN`，暂停原因为 `unknown_model_call`，resume 被阻止；数据库保存 Token/耗时/会话 ID/`termination_reason=timeout`/`token_source`；无可用 Token 时 `usage_unavailable=true` 且不伪造零费用；`output_text` 为空；重复或重叠的部分输出不会重复累计 Token。 |
 | QA-11 | 本地实施/修订角色调用因步骤上限耗尽而已知失败时，仅当全部条件满足（本地模型、实施/修订角色、同一模型与 worktree/文件范围、`implementation_max_continuations` 限额内、文件范围核验通过、无暂停/取消/接管、非 `UNKNOWN`/超时/signal/费用未知）才可在同一 OpenCode 会话内以新 segment 续接；每个 segment 拥有唯一 call_id、request_key、segment_index 与 continuation_of_call_id，并单独记录 Token、耗时与费用；续接决定必须持久化为 `continuation.scheduled` 事件，segment 间进程重启后 resume 必须只续接一次且不重复已完成 segment。任一条件不满足时必须保持安全暂停且不得续接或重试。 | 步骤耗尽后实施在限额内以 `--session` 复用同一 OpenCode 会话继续并最终完成；远程 Reviewer、`UNKNOWN`、超时、signal、越界文件、缺失会话 ID 或超过限额的场景保持暂停且 resume 不产生重复调用；续接 segment 的调用记录与 `continuation.scheduled` 事件可审计。 |
 | QA-09 | Reviewer 提示必须在 Review Packet 之外强制 JSON-only 协议：只允许一个顶层对象，`approved` 必须是 boolean，`findings` 必须是数组，每项必须有 P0-P3 `severity`、字符串 `title` 和 `explanation`，可选字符串 `path`/`remediation`。Markdown fence、前后散文、缺字段、错类型或非法严重度均不得猜测性解析；任一 P0/P1 必须覆盖 `approved=true`。 | 有效纯 JSON 产生正式 review 记录；所有非合规样例安全暂停且不得批准。 |
+| QA-12 | 任务可携带 `review_acceptance_policy` 审核接受策略：`block_p0_p1`（缺省）只让 P0/P1 阻断批准；`zero_findings` 要求零 findings（含 P2/P3）才批准。策略在解析审核结果时确定性应用，不能由审核输出覆盖。 | 相同审核输出在不同策略下产生符合定义的批准/拒绝；P2/P3 finding 在 `zero_findings` 下阻断批准，在 `block_p0_p1` 下不阻断。 |
 
 ## 11. Git 隔离与并发
 
@@ -166,6 +176,7 @@ implementation_max_continuations:
 | CTRL-01 | 控制平面必须是普通程序而非 AI 模型，负责状态机、队列、模型进程/远程任务、预算、锁、检查点、事件日志、暂停恢复、重试和通知。 | 在无模型推理时仍能推进和查询确定性状态。 |
 | CTRL-02 | 模型只应用于规划、判断、实施、审核、异常分析和整合。 | 状态查询、等待、预算比较等不会触发模型。 |
 | CTRL-03 | 控制平面必须是可选边车，只在多模型、长时间或无人值守任务中启用。 | 普通人工工作流不依赖常驻控制平面。 |
+| CTRL-04 | 计划可声明 `supervisor_policy` 主管协议：唤醒事件白名单、缺省/升级推理强度、检查点数量上限与单条内容字符上限；MVP 强制关闭持续 LLM 监控。控制平面只在确定性事件（如 P0/P1 finding、重试耗尽、接受未满足等）发生时写入有界 `supervisor_checkpoints`；`wake_events` 只能额外增加可选唤醒原因，一组强制唤醒事件（P0/P1 finding、UNKNOWN、超时/步骤/续接耗尽、会话不一致、范围/隐私/授权/网络违规、Reviewer 不可用/协议错误、费用未知、预算达限、终局等）不可被空或窄 `wake_events` 静默。主管经 `supervisor-next --after-sequence N --wait-seconds S` 读取有界 digest（仅轮询本地库、无新事件超时输出 `{changed:false,wake_required:false,cursor}`），经 `supervisor-record` 记录并校验决策（plan hash、cursor、schema、幂等重复、冲突拒绝、不得扩大授权/恢复 UNKNOWN/更改 plan）；`supervisor_digest` 提供低 Token 摘要且截断时保留 reason/P0-P1/UNKNOWN/预算/范围/plan hash/cursor，`original_bytes` 为真实 UTF-8 字节数。 | 唤醒事件由状态/审核/测试事件确定性派生；`supervisor-next` 只读本地持久化状态且不调用模型；检查点内容受字符上限约束；强制唤醒事件在未配置时仍被记录。 |
 | WAIT-01 | 顶层 Agent 不得高频调用模型轮询子任务。等待顺序必须为事件通知、非 LLM 状态检查、最后才是基于历史估时的指数退避轮询。 | 运行日志显示等待机制及调用次数。 |
 | WAIT-02 | 只应在完成、失败、需要授权、无进展或超时时唤醒顶层 Agent。 | 普通无变化状态不产生模型唤醒。 |
 | WAIT-03 | 耗时估算必须优先使用本机和实际供应商历史；互联网吞吐只作冷启动参考。 | 估算记录标明数据来源。 |

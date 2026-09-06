@@ -28,6 +28,7 @@ from agentflow.database import Database, DuplicateInvocationError, UnknownInvoca
 from agentflow.fake_adapter import FakeAdapter
 from agentflow.policies import (
     changed_files_decision,
+    classify_policy_denial,
     invocation_decision,
     remote_data_decision,
     review_independence_decision,
@@ -284,6 +285,32 @@ class ConfigTests(unittest.TestCase):
 
 
 class PolicyTests(unittest.TestCase):
+    def test_classify_policy_denial_prefers_specific_reason(self) -> None:
+        self.assertEqual(
+            "privacy_violation",
+            classify_policy_denial(("privacy denied: detected: api_key",)),
+        )
+        self.assertEqual(
+            "budget_threshold",
+            classify_policy_denial(("budget denied: max_remote_cost exceeded",)),
+        )
+        self.assertEqual(
+            "network_violation",
+            classify_policy_denial(("network denied: host blocked",)),
+        )
+        self.assertEqual(
+            "authorization_violation",
+            classify_policy_denial(("unrecognized denial",)),
+        )
+        self.assertEqual(
+            "authorization_violation",
+            classify_policy_denial(()),
+        )
+        self.assertEqual(
+            "privacy_violation",
+            classify_policy_denial(("budget denied: x", "privacy denied: y")),
+        )
+
     def test_remote_data_rules_cover_d0_through_d3(self) -> None:
         plan = make_plan()
         denied = issue_authorization(plan)
@@ -713,7 +740,11 @@ class InvocationServiceTests(unittest.TestCase):
             "provider-resolved", "recovered output", 3, 4, 5, 6, 0.25
         )
         adapter.results["provider-resolved"] = recovered
-        self.assertEqual(recovered, service.resolve_unknown("run-1", request.call_id))
+        resolved = service.resolve_unknown("run-1", request.call_id)
+        self.assertIsNotNone(resolved)
+        self.assertEqual("recovered output", resolved.output)
+        self.assertEqual(0.0, resolved.remote_cost)
+        self.assertFalse(resolved.cost_unavailable)
         reused = service.invoke(request, context)
         self.assertEqual("recovered output", reused.output)
         self.assertTrue(reused.raw_metadata["reused"])

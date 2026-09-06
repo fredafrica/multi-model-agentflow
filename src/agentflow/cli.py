@@ -8,23 +8,30 @@ import sys
 import time
 from pathlib import Path
 
-from .authorization import issue_authorization, validate_authorization
 from .adapters import AdapterRouter, ModelAdapter, UnsupportedProviderError
+from .authorization import issue_authorization, validate_authorization
 from .config import AgentFlowPaths, resolve_paths
 from .contracts import (
     AuthorizationSnapshot,
     InvocationRequest,
     InvocationResult,
+    ModelRef,
     PlanContract,
-    RunMode,
 )
 from .database import Database
 from .fake_adapter import FakeAdapter
-from .opencode_adapter import OpenCodeAdapter, RemoteOpenCodeReviewerAdapter
+from .opencode_adapter import (
+    OpenCodeAdapter,
+    RemoteOpenCodeReviewerAdapter,
+    RemoteOpenCodeWorkerAdapter,
+)
 from .runner import Runner
 from .serialization import canonical_json, load_plan_json, plan_hash
 from .states import ControlState, RunState
-from .workspace import GitWorkspace
+from .workspace import GitWorkspace, GitWorkspaceError
+
+_MAX_SUPERVISOR_WAIT_SECONDS = 60
+_SUPERVISOR_POLL_SECONDS = 0.5
 
 
 def _plan_path(paths: AgentFlowPaths, value: str | None) -> Path:
@@ -36,8 +43,11 @@ def _load_plan(paths: AgentFlowPaths, value: str | None) -> PlanContract:
     return load_plan_json(path.read_text(encoding="utf-8"))
 
 
-def _open_database(paths: AgentFlowPaths) -> Database:
-    database = Database(paths.project_runs / "agentflow.db")
+def _open_database(paths: AgentFlowPaths, *, readonly: bool = False) -> Database:
+    path = paths.project_runs / "agentflow.db"
+    if readonly:
+        return Database.open_readonly(path)
+    database = Database(path)
     database.initialize()
     return database
 
@@ -93,31 +103,84 @@ def _runner(
         raise ValueError(
             f"provider is outside the authorization: {sorted(unauthorized)}"
         )
+    worker_providers: set[str] = set()
+    reviewer_providers: set[str] = set()
     for task in plan.tasks:
         implementation = task.implementation_model
         if not implementation.is_local and implementation.provider != "fake":
-            raise ValueError(
-                "remote role denied: implementation must use a local adapter"
-            )
+            if not task.allow_remote_implementation:
+                raise ValueError(
+                    "remote role denied: remote implementation is not authorized "
+                    "for this task"
+                )
+            worker_providers.add(implementation.provider)
+        for model in (task.review_model, task.fallback_model):
+            if model is not None and not model.is_local and model.provider != "fake":
+                reviewer_providers.add(model.provider)
+
+    worker_roles = {"implementation", "revision"}
+    reviewer_roles = {"review", "rereview"}
+    worker_models: dict[str, list[ModelRef]] = {}
+    reviewer_models: dict[str, list[ModelRef]] = {}
+
+    def _add(model: ModelRef | None, roles: set[str]) -> None:
+        if model is None:
+            return
+        for role in roles:
+            bucket = worker_models if role in worker_roles else reviewer_models
+            bucket.setdefault(model.provider, []).append(model)
+
+    for task in plan.tasks:
+        _add(task.implementation_model, {"implementation", "revision"})
+        _add(task.review_model, {"review", "rereview"})
+        _add(task.fallback_model, worker_roles | reviewer_roles)
+
+    def _dedupe(models: list[ModelRef]) -> tuple[ModelRef, ...]:
+        seen: set[str] = set()
+        result: list[ModelRef] = []
+        for model in models:
+            if model.registry_key not in seen:
+                seen.add(model.registry_key)
+                result.append(model)
+        return tuple(result)
+
     adapters: dict[str, ModelAdapter] = {}
+    role_adapters: dict[tuple[str, str], ModelAdapter] = {}
     for provider in providers:
-        provider_models = tuple(model for model in models if model.provider == provider)
         if provider == "fake":
             adapters[provider] = FakeAdapter(responder=_fake_response)
-        elif provider == "lmstudio":
+            continue
+        if provider == "lmstudio":
             adapters[provider] = OpenCodeAdapter()
-        else:
-            if any(model.is_local for model in provider_models):
-                raise UnsupportedProviderError(
-                    f"unsupported provider: local provider {provider} has no adapter"
-                )
-            remote = RemoteOpenCodeReviewerAdapter(
-                provider, planned_models=provider_models
+            continue
+        provider_models = tuple(model for model in models if model.provider == provider)
+        if any(model.is_local for model in provider_models):
+            raise UnsupportedProviderError(
+                f"unsupported provider: local provider {provider} has no adapter"
             )
-            for model in provider_models:
-                remote.require_model(model)
-            adapters[provider] = remote
-    adapter = AdapterRouter(adapters)
+        worker_planned = _dedupe(worker_models.get(provider, []))
+        reviewer_planned = _dedupe(reviewer_models.get(provider, []))
+        if worker_planned:
+            remote_worker = RemoteOpenCodeWorkerAdapter(
+                provider, planned_models=worker_planned
+            )
+            for model in worker_planned:
+                remote_worker.require_model(model)
+            for role in worker_roles:
+                role_adapters[(provider, role)] = remote_worker
+        if reviewer_planned:
+            remote_reviewer = RemoteOpenCodeReviewerAdapter(
+                provider, planned_models=reviewer_planned
+            )
+            for model in reviewer_planned:
+                remote_reviewer.require_model(model)
+            for role in reviewer_roles:
+                role_adapters[(provider, role)] = remote_reviewer
+        if not worker_planned and not reviewer_planned:
+            raise UnsupportedProviderError(
+                f"unsupported provider: {provider} has no planned model"
+            )
+    adapter = AdapterRouter(adapters, role_adapters=role_adapters)
     return Runner(
         database,
         adapter,
@@ -130,6 +193,32 @@ def _show_status(database: Database, run_id: str) -> RunState:
     snapshot = database.run_snapshot(run_id)
     print(json.dumps(snapshot, ensure_ascii=False, indent=2))
     return RunState(snapshot["run"]["run_state"])
+
+
+def _status_fingerprint(database: Database, run_id: str) -> tuple[object, ...]:
+    snapshot = database.run_snapshot(run_id)
+    return (
+        snapshot["run"]["run_state"],
+        snapshot["run"]["control_state"],
+        tuple((task["task_id"], task["state"]) for task in snapshot["tasks"]),
+        database.latest_event_sequence(run_id),
+    )
+
+
+def _changed_files_by_task(
+    paths: AgentFlowPaths, database: Database, run_id: str
+) -> dict[str, list[str]]:
+    workspace = GitWorkspace(paths.project_root, paths.project_runs)
+    snapshot = database.run_snapshot(run_id)
+    result: dict[str, list[str]] = {}
+    for task in snapshot["tasks"]:
+        if not task["worktree_path"]:
+            continue
+        try:
+            result[task["task_id"]] = list(workspace.changed_files(task["worktree_path"]))
+        except GitWorkspaceError:
+            result[task["task_id"]] = []
+    return result
 
 
 def _terminal(state: RunState) -> bool:
@@ -186,6 +275,16 @@ def build_parser() -> argparse.ArgumentParser:
     cost = commands.add_parser("cost")
     cost.add_argument("run_id")
 
+    supervisor_next = commands.add_parser("supervisor-next")
+    supervisor_next.add_argument("run_id")
+    supervisor_next.add_argument("--after-sequence", type=int, default=0)
+    supervisor_next.add_argument("--wait-seconds", type=int, default=0)
+
+    supervisor_record = commands.add_parser("supervisor-record")
+    supervisor_record.add_argument("run_id")
+    supervisor_record.add_argument("checkpoint_id")
+    supervisor_record.add_argument("--decision", default=None)
+
     cancel = commands.add_parser("cancel")
     cancel.add_argument("run_id")
     return parser
@@ -198,7 +297,10 @@ def run_command(arguments: argparse.Namespace) -> int:
         print(canonical_json({"plan": plan, "sha256": plan_hash(plan)}))
         return 0
 
-    database = _open_database(paths)
+    _READ_ONLY_COMMANDS = {"status", "logs", "cost", "supervisor-next", "handoff"}
+    database = _open_database(
+        paths, readonly=arguments.command in _READ_ONLY_COMMANDS
+    )
     try:
         if arguments.command == "plan" and arguments.plan_command == "authorize":
             plan = _load_plan(paths, arguments.file)
@@ -230,8 +332,14 @@ def run_command(arguments: argparse.Namespace) -> int:
             return 0 if result.state is RunState.COMPLETED else 2
 
         if arguments.command == "status":
+            last_fingerprint: object | None = None
             while True:
-                state = _show_status(database, arguments.run_id)
+                fingerprint = _status_fingerprint(database, arguments.run_id)
+                if fingerprint != last_fingerprint:
+                    _show_status(database, arguments.run_id)
+                    last_fingerprint = fingerprint
+                snapshot = database.run_snapshot(arguments.run_id)
+                state = RunState(snapshot["run"]["run_state"])
                 if not arguments.watch or _terminal(state):
                     return 0
                 time.sleep(1)
@@ -239,6 +347,18 @@ def run_command(arguments: argparse.Namespace) -> int:
         if arguments.command == "pause":
             if arguments.immediate:
                 database.force_pause(arguments.run_id)
+                snapshot = database.run_snapshot(arguments.run_id)["run"]
+                plan = database.load_plan(snapshot["plan_id"], snapshot["plan_version"])
+                policy = plan.supervisor_policy
+                database.record_supervisor_checkpoint(
+                    arguments.run_id,
+                    "run_paused",
+                    {"run_id": arguments.run_id, "reason": "immediate_freeze"},
+                    max_chars=policy.max_checkpoint_chars,
+                    max_checkpoints=policy.max_supervisor_checkpoints,
+                    plan_hash_value=plan_hash(plan),
+                    idempotent=True,
+                )
                 local = OpenCodeAdapter()
                 for provider_request_id in database.active_provider_requests(arguments.run_id):
                     local.cancel(provider_request_id)
@@ -304,12 +424,73 @@ def run_command(arguments: argparse.Namespace) -> int:
             print(canonical_json(summary))
             return 0
 
+        if arguments.command == "supervisor-next":
+            after_sequence = arguments.after_sequence
+            wait_seconds = max(0, min(arguments.wait_seconds, _MAX_SUPERVISOR_WAIT_SECONDS))
+            deadline = time.monotonic() + wait_seconds
+            while True:
+                cursor = database.latest_event_sequence(arguments.run_id)
+                if database.pending_supervisor_checkpoints(arguments.run_id):
+                    digest = database.supervisor_digest(
+                        arguments.run_id,
+                        after_sequence=after_sequence,
+                        changed_files_by_task=_changed_files_by_task(
+                            paths, database, arguments.run_id
+                        ),
+                    )
+                    print(canonical_json(digest))
+                    return 0
+                if time.monotonic() >= deadline:
+                    print(
+                        canonical_json(
+                            {
+                                "changed": False,
+                                "wake_required": False,
+                                "cursor": cursor,
+                            }
+                        )
+                    )
+                    return 0
+                time.sleep(_SUPERVISOR_POLL_SECONDS)
+
+        if arguments.command == "supervisor-record":
+            decision = json.loads(arguments.decision) if arguments.decision else {}
+            database.acknowledge_supervisor_checkpoint(
+                arguments.run_id, arguments.checkpoint_id, decision
+            )
+            print(
+                canonical_json(
+                    {
+                        "checkpoint_id": arguments.checkpoint_id,
+                        "status": "acknowledged",
+                    }
+                )
+            )
+            return 0
+
         if arguments.command == "cancel":
+            run = database.run_snapshot(arguments.run_id)["run"]
+            current = RunState(run["run_state"])
+            if current is RunState.CANCELLED:
+                print(canonical_json(database.run_snapshot(arguments.run_id)))
+                return 0
+            if current in (RunState.COMPLETED, RunState.FAILED):
+                raise RuntimeError(f"run is already {current.value}; it cannot be cancelled")
+            plan = database.load_plan(run["plan_id"], run["plan_version"])
+            database.finalize_run(
+                arguments.run_id,
+                RunState.CANCELLED,
+                "run_cancelled",
+                {"run_id": arguments.run_id, "run_state": "cancelled"},
+                max_chars=plan.supervisor_policy.max_checkpoint_chars,
+                max_checkpoints=plan.supervisor_policy.max_supervisor_checkpoints,
+                reasoning_effort=plan.supervisor_policy.default_reasoning_effort.value,
+                plan_hash_value=plan_hash(plan),
+            )
             local = OpenCodeAdapter()
             for provider_request_id in database.active_provider_requests(arguments.run_id):
                 local.cancel(provider_request_id)
             database.mark_active_calls_unknown(arguments.run_id)
-            database.set_run_state(arguments.run_id, RunState.CANCELLED)
             print(canonical_json(database.run_snapshot(arguments.run_id)))
             return 0
     finally:
