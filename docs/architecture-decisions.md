@@ -251,6 +251,14 @@
 - 决策：计划可新增可选 `supervisor_policy`（缺省 `wake_events` 为空），声明主管唤醒事件白名单、缺省/升级推理强度、检查点数量上限与单条内容字符上限，以及可选的主管模型提示 `supervisor_model_hint`（注册表数据，不硬编码模型名）；MVP 强制 `continuous_llm_monitoring=false`（持续 LLM 监控不支持）。控制平面在唤醒事件发生时写入独立的 `supervisor_checkpoints` 表，内容受 `max_checkpoint_chars` 约束截断为合法 JSON；`wake_events` 只能额外增加可选唤醒原因，一组强制唤醒事件（与 `SUPERVISOR_MANDATORY_WAKE_EVENTS` 一致）不可被空或窄 `wake_events` 静默。主管经 `agentflow supervisor-next --after-sequence N --wait-seconds S` 读取有界 digest（仅轮询本地库、无新事件超时输出 `{changed:false,wake_required:false,cursor}`），经 `agentflow supervisor-record` 记录并校验决策（plan hash、cursor、schema、幂等重复、冲突拒绝、不得扩大授权/恢复 UNKNOWN/更改 plan）；`supervisor_digest` 提供低 Token 摘要。唤醒事件均为确定性状态/审核/测试派生的事件，不使用高频模型调用轮询。
 - 影响：主管只被确定性事件唤醒，读取的是有界摘要而非完整日志；`checkpoint_json` 仍保留原语义，不承担主管摘要。强制唤醒事件清单与 `SUPERVISOR_MANDATORY_WAKE_EVENTS` 一致，均为业务无关的通用编码。
 
+### AD-45：本地 Ollama 只读 Reviewer
+
+- 状态：已接受（Owner 原始任务要求本地 Ollama 经 OpenCode 承担仅审核路径；第 4–6 节实现细节来自 Codex 根据 Owner 于 2026-09-08 委托裁定的本次实现方案）
+- 决策：本地 Ollama（`provider='ollama'`、`is_local=True`）经 OpenCode 仅承担 `review`/`rereview`，复用 packet-only 只读最小 prompt、全工具禁用、固定 `steps=2` 与 JSON-only 协议，费用为确认零远程费用。写角色、`read_only=false` 或非回环端点在推理进程启动前确定性拒绝。
+- 端点与配置绑定：每次调用前重新读取实际 OpenCode 有效配置（`opencode debug config --pure`），验证 `provider.ollama` 的 npm 为已验证 transport、`options.baseURL` 与所选模型条目端点均为严格回环；远程、冲突、非法或无法证明的端点失败关闭（fail-closed）。验证后的回环端点与全 deny 配置写入子进程 `OPENCODE_CONFIG_CONTENT`，并移除代理变量、设置 `NO_PROXY='*'`。不新增表/字段，`ollama_host` 属于适配器运行配置而非计划字段。
+- 模型元数据与角色边界：计划内 `ModelRef` 原样保留；无计划发现时 family 保持 `None`，不猜测为 `gpt-oss`。发现只产生 `discoverable`/`unavailable`，不提升为 `callable_verified`。`AdapterRouter` 对仅注册特定角色的 provider 在其他角色上失败关闭（`ReviewerUnavailableError`），Runner 保留原始拒绝原因并安全暂停。
+- 影响：该决定覆盖 AD-34/AD-41 的远程扩展范围限制，但不放宽授权、D0-D3、预算、UNKNOWN、幂等、费用、文件或副作用规则，也不授权本次开发任务进行真实模型调用。
+
 ## 2. 原暂定、经实现验证后接受的决策
 
 ### AD-17：实现技术基线

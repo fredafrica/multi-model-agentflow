@@ -21,6 +21,7 @@ from .contracts import (
 from .database import Database
 from .fake_adapter import FakeAdapter
 from .opencode_adapter import (
+    LocalOllamaReviewerAdapter,
     OpenCodeAdapter,
     RemoteOpenCodeReviewerAdapter,
     RemoteOpenCodeWorkerAdapter,
@@ -107,6 +108,11 @@ def _runner(
     reviewer_providers: set[str] = set()
     for task in plan.tasks:
         implementation = task.implementation_model
+        if implementation.provider == "ollama":
+            raise UnsupportedProviderError(
+                "local Ollama models are review-only and cannot be the "
+                "implementation model"
+            )
         if not implementation.is_local and implementation.provider != "fake":
             if not task.allow_remote_implementation:
                 raise ValueError(
@@ -152,6 +158,27 @@ def _runner(
             continue
         if provider == "lmstudio":
             adapters[provider] = OpenCodeAdapter()
+            continue
+        if provider == "ollama":
+            ollama_reviewer_planned = _dedupe(reviewer_models.get(provider, []))
+            if not ollama_reviewer_planned:
+                raise UnsupportedProviderError(
+                    "unsupported provider: ollama has no planned review model"
+                )
+            for model in ollama_reviewer_planned:
+                if not model.is_local or model.provider != "ollama":
+                    raise UnsupportedProviderError(
+                        "planned Ollama review models must be local ollama models"
+                    )
+            # Deliberately not added to the default ``adapters`` map: only the
+            # review/rereview roles resolve, so implementation/revision never route here.
+            local_ollama_reviewer = LocalOllamaReviewerAdapter(
+                planned_models=ollama_reviewer_planned
+            )
+            for model in ollama_reviewer_planned:
+                local_ollama_reviewer.require_model(model)
+            for role in reviewer_roles:
+                role_adapters[(provider, role)] = local_ollama_reviewer
             continue
         provider_models = tuple(model for model in models if model.provider == provider)
         if any(model.is_local for model in provider_models):

@@ -29,6 +29,7 @@
 | PLAT-03 | 第一版在 macOS 开发和验证；核心任务格式、SQLite 数据及适配器接口应保持跨平台。 | 核心持久化不依赖 macOS 专属路径或 API；专属增强被隔离。 |
 | PLAT-04 | 第一版不开发网页控制台。 | MVP 交付清单中没有 Web UI。 |
 | PLAT-05 | AgentFlow 必须能通过 OpenCode 调用计划与授权快照共同限定的远程 provider/model。远程 Reviewer 仅执行独立、只读的 `review`/`rereview`，不得绕过控制平面；远程 Worker 仅在任务合同显式允许（`allow_remote_implementation=true`）时承担 `implementation`/`revision`，并在最小临时沙箱内运行、网络默认拒绝。 | 使用 OpenCode 替身可观察到参数数组 `run --model <provider>/<model-id>`；未授权 provider、越界角色或非只读 Reviewer 请求在进程启动前被确定性拒绝。 |
+| PLAT-06 | AgentFlow 必须能通过 OpenCode 调用本地 Ollama 承担仅 `review`/`rereview` 角色。本地 Ollama 只接受严格回环端点、packet-only 只读最小 prompt 与全工具禁用；`implementation`/`revision` 等写角色、`read_only=false` 或非回环端点必须在任何推理进程启动前确定性拒绝。 | 使用 OpenCode 替身可观察到本地 Ollama 仅注册到 `review`/`rereview` 角色路由，写角色或远程端点调用被前置拒绝且推理 `Popen` 次数为 0。 |
 
 当前环境中的 Qwen 3.8 27B Q4、Qwen 3.8 27B 8-bit、GPT-OSS、DeepSeek V4 Flash 和 DeepSeek V4 Pro，以及未来可能采用的 GPT、Claude 或其他模型，均只视为用户提供的候选记录；名称、可用性和能力须在使用时发现或验证，不能成为通用 Skill 的永久默认值。
 
@@ -49,6 +50,7 @@
 | MODEL-11 | 在项目实测前，DeepSeek V4 Pro 可以参与重要任务和关键架构的反方审核，但不得自动成为最高风险架构任务的唯一规划者。 | 未满足实测条件的计划会阻止该唯一规划者组合。 |
 | MODEL-12 | 信任统计必须按供应商、精确模型版本和任务类型隔离；至少有 20 个经独立审核的任务后，系统才可以提示提升信任，且不得自动提升。 | 小于 20 个合格样本时无升级建议；满足样本量后仍需用户确认。 |
 | MODEL-13 | 模型发现必须区分 `unsupported`、`not_configured`、`discoverable`、`unavailable`、`callable_unverified` 与 `callable_verified`；OpenCode 无推理列表只能证明配置/可发现，不能证明真实可调用。 | 发现流程不发送推理请求；只有另行计划、哈希批准的 smoke test 才能写入 `callable_verified`。 |
+| MODEL-14 | 本地 Ollama Reviewer 在每次调用前必须重新验证实际 OpenCode 有效配置（`provider.ollama` 的 npm、`options.baseURL` 与所选模型条目），端点必须是确定性回环；错误配置、远程端点、无法证明的端点或配置冲突必须失败关闭，不得用构造时快照或环境变量替代实际调用地址。未提供计划元数据的发现不得猜测模型 family（保持 `None`）。 | 远程/冲突/非法端点与未知 transport 都以受控异常拒绝且推理 `Popen` 次数为 0；无计划发现时 `family` 为 `None`。 |
 
 ## 5. 激活、运行模式与授权
 

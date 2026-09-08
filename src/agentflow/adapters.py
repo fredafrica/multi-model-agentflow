@@ -110,10 +110,19 @@ class AdapterRouter:
             key = (provider, role)
             if key in self.role_adapters:
                 return self.role_adapters[key]
-        try:
+        if provider in self.adapters:
             return self.adapters[provider]
-        except KeyError as error:
-            raise ValueError(f"no adapter registered for provider: {provider}") from error
+        # A provider registered only for specific roles (e.g. a local, review-only
+        # Ollama reviewer) must not silently serve other roles such as an
+        # implementation fallback: fail closed with a clean, catchable denial rather
+        # than an opaque routing error.
+        if role is not None and any(
+            known_provider == provider for (known_provider, _role) in self.role_adapters
+        ):
+            raise ReviewerUnavailableError(
+                f"provider {provider} is not available for role {role}"
+            )
+        raise ValueError(f"no adapter registered for provider: {provider}")
 
     def discover(self) -> Sequence[ModelRecord]:
         adapters = {id(adapter): adapter for adapter in self.adapters.values()}

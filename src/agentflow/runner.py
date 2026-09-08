@@ -561,11 +561,28 @@ class Runner:
         first_denial: PolicyDeniedError | ReviewerUnavailableError | None = None
         for candidate in candidates:
             call_id = planned_call_id or str(uuid4())
-            selected_adapter = (
-                self.adapter.adapter_for(candidate.provider, role)
-                if isinstance(self.adapter, AdapterRouter)
-                else self.adapter
-            )
+            try:
+                selected_adapter = (
+                    self.adapter.adapter_for(candidate.provider, role)
+                    if isinstance(self.adapter, AdapterRouter)
+                    else self.adapter
+                )
+            except ReviewerUnavailableError as error:
+                # A role-restricted provider (e.g. a local, review-only Ollama model
+                # reached through the fallback field for an implementation/revision role)
+                # is a clean, deterministic denial: it never silently serves the wrong
+                # role and does not escalate to a routing crash.
+                first_denial = first_denial or error
+                if candidate == candidates[-1]:
+                    raise first_denial
+                self.database.record_model_fallback(
+                    run_id,
+                    task.task_id,
+                    role,
+                    candidate.registry_key,
+                    candidates[-1].registry_key,
+                )
+                continue
             remote_write = (
                 role in ("implementation", "revision") and not candidate.is_local
             )

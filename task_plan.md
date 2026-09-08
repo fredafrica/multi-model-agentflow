@@ -2,15 +2,15 @@
 
 ## Goal
 
-修复 OpenCode 本地 implementation 调用的固定总超时问题，以及超时后 Token/审计元数据丢失的问题；新增 `implementation_timeout_seconds` 计划字段，完成无费用回归验证、离线构建和 canonical/installed Skill 同步。
+修复现有本地 Ollama packet-only Reviewer 实现，补齐行为测试与文档，在不回归既有路径的前提下交付给 Codex 复核。
 
 ## Current Phase
 
-里程碑 19 主体实现完成，正在修复 Codex 独立验收（`CHANGES_REQUIRED`）提出的 P0/P1/P2 项：最小临时沙箱、严格类型校验、真实输入快照、远程超时审计、完整主管协议、增量 `status --watch`、角色感知 fallback 路由与文档修正。当前全套 239 项测试通过；本轮不调用真实模型、不启动子 Agent、不产生 API 费用、不创建 commit。
+里程碑 20 已由 Codex 于 2026-09-08 正式独立批准（REVIEW_PASSED）。R01–R05 及 R04 混合使用量残余已关闭；最终 442 项全量测试和 14 项独立检查通过，离线构建与隔离安装通过。未执行额外真实模型 smoke，未提交、推送或更新全局安装。最终证据见 `docs/verification/2026-09-08-ollama-reviewer-codex-approval.md`。
 
 ## Next Step
 
-完成剩余文档修正后，同步 canonical/installed Skill、离线构建 wheel 并在干净隔离环境安装验证；最终复核 `findings.md`/`progress.md` SHA-256 未变化。
+本次实现与验收已关闭，保留未提交 diff 交付。后续提交、整合、安装或真实模型验证须由用户另行安排，不自动启动。
 
 ## Milestones
 
@@ -210,6 +210,17 @@
 - [x] CLI 新增 `supervisor-next`（`--after-sequence`/`--wait-seconds`，仅轮询本地库）与 `supervisor-record`（校验 plan hash/cursor/决策 schema、幂等重复、冲突拒绝、不得扩大授权/恢复 UNKNOWN/更改 plan）；`status --watch` 首次全量、后续仅在状态或事件序列变化时输出；`_runner` 按 provider+role 注册 Worker/Reviewer 适配器（不再误报同 provider 双角色）
 - [x] 远程 Worker 超时/中断持久化部分 stdout 字节与 SHA、时长、session ID、`termination_reason=timeout`
 - [x] 新增/修订回归测试（严格类型、沙箱隔离、全有或全无、输入快照事件、终局幂等、上限强制、supervisor-record 校验、digest 截断），全套 239 项通过；`git diff --check` 与 compileall 通过
+
+### 里程碑 20：本地 Ollama Reviewer 收尾
+
+**Status:** complete — REVIEW_PASSED（Codex，2026-09-08）
+
+- [x] A 工作单元：严格回环端点解析（标准库 `urlsplit` + `ipaddress`，拒绝 IPv4-mapped、zone id、userinfo、query/fragment、非法端口等），与 shared `_run_opencode_packet_review` 的 `prepare_environment` 回调绑定实际 OpenCode 有效配置端点
+- [x] B 工作单元：修复 `ReviewerUnavailableError` 未导入（H01）、无计划发现 family 猜测为 gpt-oss（H04）、usage 解析缺 `usage_unavailable`/`token_source`（H05）、测试 helper `_completed_process` 未定义（H06）；补齐失败/UNKNOWN/协议/路由/授权/JSON 审核闭环测试（H09）
+- [x] C 工作单元：FakeAdapter 实现 + 真实 LocalOllamaReviewerAdapter（stub subprocess）走真实 Runner 路径的无费用集成；写角色 fallback 到 Ollama 从未调用本地 Reviewer
+- [x] D 工作单元：requirements 新增 PLAT-06/MODEL-14、MVP 2.8 与 MVP-A32/A33、AD-45、模型资料 `docs/models/ollama-gpt-oss-120b.md`、自测报告 `docs/verification/2026-09-08-ollama-reviewer.md`
+- [x] 确定性全量测试通过（最终总数以交付报告记录为准）；compileall、`git diff --check`、离线 wheel 构建与隔离安装验证
+- [x] Codex 独立关闭 R01–R05：442 项全量与 14 项独立检查通过；最终批准报告已归档，未授权提交/部署
 
 ## Decisions Made
 

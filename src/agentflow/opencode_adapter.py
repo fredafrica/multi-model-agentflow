@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -12,9 +13,10 @@ import signal
 import subprocess
 import tempfile
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from .adapters import (
     InvocationIncompleteError,
@@ -22,6 +24,7 @@ from .adapters import (
     ModelUnavailableError,
     ProviderNotConfiguredError,
     ReviewerProtocolError,
+    ReviewerUnavailableError,
     UnsupportedProviderError,
     WorkerProtocolError,
 )
@@ -293,6 +296,10 @@ def _discover_remote_model_ids(
         raise UnsupportedProviderError(
             "unsupported provider: OpenCode model discovery is unavailable"
         ) from error
+    except OSError as error:
+        raise UnsupportedProviderError(
+            "unsupported provider: OpenCode model discovery is unavailable"
+        ) from error
     if result.returncode:
         raise ProviderNotConfiguredError(
             f"provider not configured: {provider}"
@@ -310,6 +317,331 @@ def _discover_remote_model_ids(
     for model_id in model_ids:
         validate_model_id(model_id)
     return model_ids
+
+
+_DEFAULT_OLLAMA_PORT = 11434
+_DEFAULT_OLLAMA_PATH = "/v1"
+_DEFAULT_OLLAMA_ENDPOINT = "http://127.0.0.1:11434/v1"
+
+
+def _normalize_loopback_host(host: str) -> str:
+    """Return the numeric loopback host for ``host``, or raise ``ValueError``.
+
+    Only the case-insensitive exact ``localhost`` name, an IPv4 address in
+    ``127.0.0.0/8``, or the IPv6 loopback ``::1`` (including equivalent expanded
+    forms) is accepted. Everything else -- including ``localhost.``, subdomains,
+    IPv4-mapped IPv6, IPv6 zone identifiers, and non-loopback addresses -- is
+    rejected. ``localhost`` is normalized to ``127.0.0.1`` so no DNS lookup is
+    ever needed to compare endpoints.
+    """
+    if not host:
+        raise ValueError("Ollama endpoint host is missing")
+    if "%" in host:
+        raise ValueError("Ollama endpoint must not include an IPv6 zone identifier")
+    if host.lower() == "localhost":
+        return "127.0.0.1"
+    try:
+        ipv4 = ipaddress.IPv4Address(host)
+    except ValueError:
+        ipv4 = None
+    if ipv4 is not None:
+        if not ipv4.is_loopback:
+            raise ValueError("Ollama endpoint host is not a loopback address")
+        return str(ipv4)
+    try:
+        ipv6 = ipaddress.IPv6Address(host)
+    except ValueError:
+        ipv6 = None
+    if ipv6 is not None:
+        if ipv6.ipv4_mapped is not None:
+            raise ValueError("Ollama endpoint must not use an IPv4-mapped IPv6 address")
+        if not ipv6.is_loopback:
+            raise ValueError("Ollama endpoint host is not a loopback address")
+        return str(ipv6)
+    raise ValueError("Ollama endpoint host is not a loopback address")
+
+
+def _parse_decimal_port(text: str) -> int:
+    """Parse a strict decimal port string, rejecting empty/non-decimal values."""
+    if not text or not text.isdigit():
+        raise ValueError("Ollama endpoint port must be a decimal integer")
+    return int(text)
+
+
+def _parse_bare_ollama_endpoint(value: str) -> tuple[str, int | None, str]:
+    """Split a scheme-less endpoint into ``(host, port, path)``.
+
+    ``value`` has already been checked for internal whitespace/control
+    characters and backslashes. A bare IPv6 address (which may contain many
+    colons) is recognized with :func:`ipaddress.IPv6Address` before any
+    ``host:port`` splitting, so ``::1`` is never misread as a host with a port.
+    """
+    if value.startswith("["):
+        close = value.find("]")
+        if close == -1:
+            raise ValueError("Ollama endpoint IPv6 brackets are unbalanced")
+        host = value[1:close]
+        rest = value[close + 1:]
+        if not rest:
+            return host, None, ""
+        if not rest.startswith(":"):
+            raise ValueError("Ollama endpoint has an invalid bracketed-host suffix")
+        return host, _parse_decimal_port(rest[1:]), ""
+    if ":" in value:
+        try:
+            ipaddress.IPv6Address(value)
+        except ValueError:
+            pass
+        else:
+            return value, None, ""
+        host, _, port_text = value.rpartition(":")
+        return host, _parse_decimal_port(port_text), ""
+    return value, None, ""
+
+
+def _normalize_ollama_endpoint(raw: object) -> str:
+    """Normalize a local Ollama endpoint to a canonical URL, or raise ``ValueError``.
+
+    Accepts a full ``http``/``https`` URL, a bare IPv4/localhost name, a
+    ``host:port`` pair, a bare IPv6 address, or a bracketed IPv6 address with an
+    optional port. ``None``, an empty string, or pure whitespace yields the
+    deterministic Ollama default ``http://127.0.0.1:11434/v1``.
+
+    Only loopback hosts are accepted. Any other domain, ``localhost.``,
+    subdomain, IPv4-mapped IPv6, IPv6 zone id, unbalanced bracket, non-http(s)
+    scheme, userinfo, query, fragment, backslash, internal whitespace/control
+    character, or non-decimal/out-of-range port raises ``ValueError``. A missing
+    scheme defaults to ``http``, a missing port to ``11434``, and a missing or
+    root path to ``/v1``; an explicit non-root path is preserved verbatim. The
+    returned value is a canonical ``scheme://host:port/path`` string with the
+    host normalized to a numeric loopback form, never the raw input (which may
+    contain credentials and must not leak into an error message).
+    """
+    if raw is None:
+        return _DEFAULT_OLLAMA_ENDPOINT
+    if not isinstance(raw, str):
+        raise ValueError("Ollama endpoint must be a string or None")
+    value = raw.strip()
+    if not value:
+        return _DEFAULT_OLLAMA_ENDPOINT
+    if any(ch.isspace() or ord(ch) < 0x20 for ch in value):
+        raise ValueError("Ollama endpoint contains whitespace or control characters")
+    if "\\" in value:
+        raise ValueError("Ollama endpoint must not contain backslashes")
+    scheme = "http"
+    host: str
+    port: int | None
+    path: str
+    if "://" in value:
+        try:
+            parsed = urlsplit(value)
+        except ValueError as error:
+            raise ValueError("Ollama endpoint URL is invalid") from error
+        if parsed.scheme.lower() not in ("http", "https"):
+            raise ValueError("Ollama endpoint scheme must be http or https")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("Ollama endpoint must not include userinfo")
+        # An empty query or fragment marker ("?" or "#") is still a query/fragment.
+        if "?" in value or "#" in value:
+            raise ValueError("Ollama endpoint must not include a query or fragment")
+        host = parsed.hostname or ""
+        # A written-but-empty port ("http://localhost:/v1") has an authority ending
+        # in ":"; it is distinct from a completely absent port, which is filled with
+        # the default below and must not be silently treated as if it were missing.
+        if parsed.netloc.endswith(":"):
+            raise ValueError("Ollama endpoint must not include an empty port")
+        try:
+            port = parsed.port
+        except ValueError as error:
+            raise ValueError("Ollama endpoint port is invalid") from error
+        path = parsed.path
+        scheme = parsed.scheme.lower()
+    else:
+        host, port, path = _parse_bare_ollama_endpoint(value)
+    normalized_host = _normalize_loopback_host(host)
+    if port is None:
+        port = _DEFAULT_OLLAMA_PORT
+    if not 1 <= port <= 65535:
+        raise ValueError("Ollama endpoint port must be between 1 and 65535")
+    if path in ("", "/"):
+        path = _DEFAULT_OLLAMA_PATH
+    authority = f"[{normalized_host}]" if ":" in normalized_host else normalized_host
+    return f"{scheme}://{authority}:{port}{path}"
+
+
+def ollama_host_is_loopback(raw: object) -> bool:
+    """Return whether an Ollama endpoint is a deterministic local loopback.
+
+    ``raw`` is the value of ``OLLAMA_HOST`` (a URL, a ``host:port`` pair, a bare
+    host, or ``None``/empty meaning the deterministic Ollama default of
+    ``127.0.0.1:11434``). Only loopback endpoints (``localhost``, the IPv4
+    ``127.0.0.0/8`` range, and the IPv6 ``::1``) count as local; anything else --
+    including non-loopback hosts, malformed URLs, bad ports, and non-string
+    inputs -- returns ``False`` so the caller can fail closed rather than record
+    a remote endpoint as a free local call. Parsing is purely lexical via
+    :func:`ipaddress` and :func:`urllib.parse.urlsplit`: no DNS resolution or
+    network probe is performed.
+    """
+    try:
+        _normalize_ollama_endpoint(raw)
+    except ValueError:
+        return False
+    return True
+
+
+def _run_opencode_packet_review(
+    *,
+    command_prefix: tuple[str, ...],
+    config_content: str,
+    prompt: str,
+    timeout_seconds: int,
+    is_local: bool,
+    review_label: str,
+    model_label: str = "",
+    on_provider_request_id=None,
+    prepare_environment: Callable[[Path, dict[str, str]], None] | None = None,
+) -> InvocationResult:
+    """Run a packet-only OpenCode review process and parse its outcome.
+
+    This is the shared execution path for every packet-only reviewer (remote
+    providers and the local Ollama provider): a fresh, read-only temp directory is
+    used as ``--dir`` so the model never sees a repository, the bounded permission
+    config is injected via ``OPENCODE_CONFIG_CONTENT``, and timeout / interrupt /
+    signal / non-zero-exit / step-limit semantics are handled identically. ``is_local``
+    drives both the usage parse and the timeout cost: a local call always reports a
+    confirmed zero remote cost, while a remote call marks the cost unavailable when
+    the provider did not report one.
+
+    A ``prepare_environment`` callback, when supplied, runs after the temp dir is
+    created but before ``Popen``. It receives the review root and the environment
+    that will be handed to the child process, and may overwrite
+    ``OPENCODE_CONFIG_CONTENT`` (for example to bind a verified local endpoint) or
+    fail closed by raising a ``ReviewerUnavailableError``. Remote reviewers pass no
+    callback and keep the plain config content.
+    """
+    environment = os.environ.copy()
+    environment["OPENCODE_CONFIG_CONTENT"] = config_content
+    with tempfile.TemporaryDirectory(prefix="agentflow-review-") as directory:
+        review_root = Path(directory)
+        review_root.chmod(0o500)
+        if prepare_environment is not None:
+            prepare_environment(review_root, environment)
+        command: tuple[str, ...] = (*command_prefix, "--dir", str(review_root), prompt)
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            cwd=str(review_root),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
+            start_new_session=True,
+        )
+        process_reference = f"opencode-process-group:{process.pid}"
+        if callable(on_provider_request_id):
+            on_provider_request_id(process_reference)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired as error:
+            OpenCodeAdapter().cancel(process_reference)
+            partial_stdout, cleanup_incomplete = _collect_timeout_output(error, process)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = parse_opencode_partial_usage(
+                partial_stdout,
+                duration_ms=duration_ms,
+                timeout_seconds=timeout_seconds,
+                cost_unavailable=not is_local,
+                cleanup_incomplete=cleanup_incomplete,
+            )
+            raise InvocationOutcomeUnknown(
+                f"{review_label} timed out; no result is available",
+                process_reference,
+                result=result,
+                termination_reason="timeout",
+            ) from error
+        except KeyboardInterrupt as error:
+            OpenCodeAdapter().cancel(process_reference)
+            drained, cleanup_incomplete = _bounded_drain(process)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = parse_opencode_partial_usage(
+                drained,
+                duration_ms=duration_ms,
+                cost_unavailable=not is_local,
+                cleanup_incomplete=cleanup_incomplete,
+                termination_reason="interrupted",
+            )
+            raise InvocationOutcomeUnknown(
+                f"invocation outcome unknown: {review_label} was interrupted",
+                process_reference,
+                result=result,
+                termination_reason="interrupted",
+            ) from error
+        except OSError as error:
+            OpenCodeAdapter().cancel(process_reference)
+            drained, cleanup_incomplete = _bounded_drain(process)
+            duration_ms = int((time.monotonic() - started) * 1000)
+            result = parse_opencode_partial_usage(
+                drained,
+                duration_ms=duration_ms,
+                cost_unavailable=not is_local,
+                cleanup_incomplete=cleanup_incomplete,
+                termination_reason="communication_error",
+            )
+            raise InvocationOutcomeUnknown(
+                f"invocation outcome unknown: {review_label} communication failed",
+                process_reference,
+                result=result,
+                termination_reason="communication_error",
+            ) from error
+        duration_ms = int((time.monotonic() - started) * 1000)
+        if process.returncode is not None and process.returncode < 0:
+            result = parse_opencode_partial_usage(
+                _as_output_bytes(stdout),
+                duration_ms=duration_ms,
+                cost_unavailable=not is_local,
+                termination_reason="signal_terminated",
+            )
+            raise InvocationOutcomeUnknown(
+                f"invocation outcome unknown: {review_label} was terminated",
+                process_reference,
+                result=result,
+                termination_reason="signal_terminated",
+            )
+        if process.returncode:
+            try:
+                parse_opencode_json(
+                    stdout, duration_ms=duration_ms, is_local=is_local
+                )
+            except InvocationIncompleteError:
+                raise
+            except RuntimeError:
+                pass
+            failed_usage = parse_opencode_failed_usage(
+                _as_output_bytes(stdout),
+                duration_ms=duration_ms,
+                is_local=is_local,
+                termination_reason="nonzero_exit",
+            )
+            raise ReviewerProtocolError(
+                f"{review_label} failed: " + (stderr.strip() or model_label),
+                result=failed_usage,
+            )
+        try:
+            return parse_opencode_json(
+                stdout, duration_ms=duration_ms, is_local=is_local
+            )
+        except InvocationIncompleteError:
+            raise
+        except RuntimeError as error:
+            failed_usage = parse_opencode_failed_usage(
+                _as_output_bytes(stdout),
+                duration_ms=duration_ms,
+                is_local=is_local,
+                termination_reason="no_usable_result",
+            )
+            raise ReviewerProtocolError(
+                f"{review_label} returned no usable result", result=failed_usage
+            ) from error
 
 
 class RemoteOpenCodeReviewerAdapter:
@@ -389,110 +721,31 @@ class RemoteOpenCodeReviewerAdapter:
         if not request.read_only:
             raise ValueError("remote role denied: reviewer must be read-only")
         self.require_model(request.model)
-        environment = os.environ.copy()
-        environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
-            self._permission_config(), separators=(",", ":")
+        model_label = f"{self.provider}/{request.model.model_id}"
+        command_prefix = (
+            self.opencode_command,
+            "run",
+            "--format",
+            "json",
+            "--pure",
+            "--auto",
+            "--agent",
+            "agentflow-remote-reviewer",
+            "--model",
+            model_label,
         )
-        with tempfile.TemporaryDirectory(prefix="agentflow-review-") as directory:
-            review_root = Path(directory)
-            review_root.chmod(0o500)
-            command = (
-                self.opencode_command,
-                "run",
-                "--format",
-                "json",
-                "--pure",
-                "--auto",
-                "--agent",
-                "agentflow-remote-reviewer",
-                "--model",
-                f"{self.provider}/{request.model.model_id}",
-                "--dir",
-                str(review_root),
-                request.prompt,
-            )
-            started = time.monotonic()
-            process = subprocess.Popen(
-                command,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=environment,
-                start_new_session=True,
-            )
-            process_reference = f"opencode-process-group:{process.pid}"
-            callback = request.metadata.get("on_provider_request_id")
-            if callable(callback):
-                callback(process_reference)
-            try:
-                stdout, stderr = process.communicate(timeout=self.timeout_seconds)
-            except subprocess.TimeoutExpired as error:
-                OpenCodeAdapter().cancel(process_reference)
-                partial_stdout, cleanup_incomplete = _collect_timeout_output(
-                    error, process
-                )
-                duration_ms = int((time.monotonic() - started) * 1000)
-                result = parse_opencode_partial_usage(
-                    partial_stdout,
-                    duration_ms=duration_ms,
-                    timeout_seconds=self.timeout_seconds,
-                    cost_unavailable=True,
-                    cleanup_incomplete=cleanup_incomplete,
-                )
-                raise InvocationOutcomeUnknown(
-                    "remote OpenCode review timed out; no result is available",
-                    process_reference,
-                    result=result,
-                    termination_reason="timeout",
-                ) from error
-            except (KeyboardInterrupt, OSError) as error:
-                OpenCodeAdapter().cancel(process_reference)
-                _bounded_drain(process)
-                raise InvocationOutcomeUnknown(
-                    "invocation outcome unknown: remote OpenCode review was interrupted",
-                    process_reference,
-                ) from error
-            duration_ms = int((time.monotonic() - started) * 1000)
-            if process.returncode is not None and process.returncode < 0:
-                raise InvocationOutcomeUnknown(
-                    "invocation outcome unknown: remote OpenCode review was terminated",
-                    process_reference,
-                    termination_reason="signal_terminated",
-                )
-            if process.returncode:
-                try:
-                    parse_opencode_json(stdout, duration_ms=duration_ms, is_local=False)
-                except InvocationIncompleteError:
-                    raise
-                except RuntimeError:
-                    pass
-                failed_usage = parse_opencode_failed_usage(
-                    _as_output_bytes(stdout),
-                    duration_ms=duration_ms,
-                    is_local=False,
-                    termination_reason="nonzero_exit",
-                )
-                raise ReviewerProtocolError(
-                    "remote reviewer failed: "
-                    + (stderr.strip() or f"{self.provider}/{request.model.model_id}"),
-                    result=failed_usage,
-                )
-            try:
-                return parse_opencode_json(
-                    stdout, duration_ms=duration_ms, is_local=False
-                )
-            except InvocationIncompleteError:
-                raise
-            except RuntimeError as error:
-                failed_usage = parse_opencode_failed_usage(
-                    _as_output_bytes(stdout),
-                    duration_ms=duration_ms,
-                    is_local=False,
-                    termination_reason="no_usable_result",
-                )
-                raise ReviewerProtocolError(
-                    "remote reviewer returned no usable result", result=failed_usage
-                ) from error
+        return _run_opencode_packet_review(
+            command_prefix=command_prefix,
+            config_content=json.dumps(
+                self._permission_config(), separators=(",", ":")
+            ),
+            prompt=request.prompt,
+            timeout_seconds=self.timeout_seconds,
+            is_local=False,
+            review_label="remote OpenCode review",
+            model_label=model_label,
+            on_provider_request_id=request.metadata.get("on_provider_request_id"),
+        )
 
     def query(self, provider_request_id: str) -> InvocationResult | None:
         return None
@@ -525,6 +778,459 @@ class RemoteOpenCodeReviewerAdapter:
             "agent": {
                 "agentflow-remote-reviewer": {
                     "description": "Packet-only read-only AgentFlow reviewer",
+                    "mode": "primary",
+                    "steps": REMOTE_REVIEWER_MAX_STEPS,
+                    "permission": permission,
+                }
+            },
+        }
+
+
+_OLLAMA_DENY_TOOLS = (
+    "read",
+    "glob",
+    "grep",
+    "edit",
+    "write",
+    "bash",
+    "shell",
+    "external_directory",
+    "webfetch",
+    "websearch",
+    "task",
+    "subagent",
+    "skill",
+    "question",
+)
+
+
+def _reviewer_deny_permission() -> dict[str, Any]:
+    """A deny-by-default permission object with every tool explicitly denied."""
+    return dict.fromkeys(_OLLAMA_DENY_TOOLS, "deny", ) | {"*": "deny"}
+
+
+def _local_ollama_permission_config(
+    *, model_id: str, endpoint: str, model_entry: Mapping[str, Any] | None
+) -> dict[str, Any]:
+    """Build the child config that binds a verified loopback Ollama endpoint.
+
+    The selected model's existing metadata is preserved, but its ``options.baseURL``
+    is pinned to the verified endpoint so no higher-precedence config can override
+    the endpoint back to a remote address. Both the global and the agent permission
+    layers deny every tool, and ``enabled_providers`` is exactly ``ollama``.
+    """
+    permission = _reviewer_deny_permission()
+    model_config = dict(model_entry) if model_entry else {}
+    model_options = model_config.get("options")
+    if not isinstance(model_options, Mapping):
+        model_options = {}
+    model_config["options"] = {**dict(model_options), "baseURL": endpoint}
+    return {
+        "$schema": "https://opencode.ai/config.json",
+        "enabled_providers": ["ollama"],
+        "provider": {
+            "ollama": {
+                "npm": "@ai-sdk/openai-compatible",
+                "options": {"baseURL": endpoint},
+                "models": {model_id: model_config},
+            }
+        },
+        "permission": permission,
+        "agent": {
+            "agentflow-local-ollama-reviewer": {
+                "description": "Packet-only read-only local Ollama reviewer",
+                "mode": "primary",
+                "steps": REMOTE_REVIEWER_MAX_STEPS,
+                "permission": permission,
+            }
+        },
+    }
+
+
+def _read_resolved_config(
+    opencode_command: str,
+    review_root: Path,
+    timeout_seconds: int,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> str:
+    """Return the stdout of ``opencode debug config --pure``, failing closed.
+
+    A missing executable or an un-runnable config-discovery command is an
+    ``UnsupportedProviderError``; a config-discovery timeout is a
+    ``ProviderNotConfiguredError``. The full resolved config is never logged or
+    embedded in an error message.
+    """
+    try:
+        result = subprocess.run(
+            (opencode_command, "debug", "config", "--pure"),
+            cwd=str(review_root),
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout_seconds,
+            env=None if environment is None else dict(environment),
+        )
+    except FileNotFoundError as error:
+        raise UnsupportedProviderError("OpenCode executable is unavailable") from error
+    except PermissionError as error:
+        raise UnsupportedProviderError("OpenCode executable is not runnable") from error
+    except subprocess.TimeoutExpired as error:
+        raise ProviderNotConfiguredError("OpenCode config discovery timed out") from error
+    except OSError as error:
+        raise UnsupportedProviderError(
+            "OpenCode config discovery could not run"
+        ) from error
+    if result.returncode:
+        raise UnsupportedProviderError("OpenCode config discovery failed to run")
+    return result.stdout
+
+
+def _parse_resolved_ollama_config(
+    text: str, *, model_id: str | None = None
+) -> dict[str, Any]:
+    """Parse a resolved OpenCode config and return the Ollama summary.
+
+    Reads ``provider.ollama`` (``npm``, ``options.baseURL``) and, when a model ID
+    is requested, the selected model entry. The ``npm`` must be
+    ``@ai-sdk/openai-compatible`` and the base URL must normalize to a local
+    loopback. Any missing section, invalid JSON, unknown transport, or
+    non-loopback endpoint is a controlled ``ProviderNotConfiguredError``.
+    """
+    try:
+        config = json.loads(text)
+    except json.JSONDecodeError as error:
+        raise ProviderNotConfiguredError(
+            "OpenCode resolved config is not valid JSON"
+        ) from error
+    if not isinstance(config, Mapping):
+        raise ProviderNotConfiguredError("OpenCode resolved config must be a JSON object")
+    providers = config.get("provider")
+    if not isinstance(providers, Mapping):
+        raise ProviderNotConfiguredError("resolved config has no provider section")
+    ollama = providers.get("ollama")
+    if not isinstance(ollama, Mapping):
+        raise ProviderNotConfiguredError("Ollama provider is not configured")
+    npm = ollama.get("npm")
+    if npm != "@ai-sdk/openai-compatible":
+        raise ProviderNotConfiguredError("unsupported Ollama transport")
+    options = ollama.get("options")
+    if not isinstance(options, Mapping):
+        raise ProviderNotConfiguredError("Ollama provider options are missing")
+    base_url = options.get("baseURL")
+    if not isinstance(base_url, str) or not base_url.strip():
+        raise ProviderNotConfiguredError("Ollama provider baseURL is missing")
+    try:
+        endpoint = _normalize_ollama_endpoint(base_url)
+    except ValueError as error:
+        raise ProviderNotConfiguredError(
+            "Ollama provider baseURL is not a local loopback"
+        ) from error
+    model_entry = None
+    models = ollama.get("models")
+    if model_id is not None and isinstance(models, Mapping):
+        candidate = models.get(model_id)
+        if isinstance(candidate, Mapping):
+            model_entry = candidate
+    enabled = config.get("enabled_providers")
+    enabled_providers = tuple(enabled) if isinstance(enabled, (list, tuple)) else None
+    return {
+        "npm": npm,
+        "endpoint": endpoint,
+        "model_entry": model_entry,
+        "enabled_providers": enabled_providers,
+        "permission": config.get("permission"),
+        "agent": config.get("agent"),
+    }
+
+
+def _check_endpoint_override(raw: object, endpoint: str, label: str) -> None:
+    if not isinstance(raw, str) or not raw.strip():
+        raise ProviderNotConfiguredError(f"{label} is not a valid string")
+    try:
+        normalized = _normalize_ollama_endpoint(raw)
+    except ValueError as error:
+        raise ProviderNotConfiguredError(f"{label} is not a local loopback") from error
+    if normalized != endpoint:
+        raise ProviderNotConfiguredError(f"{label} conflicts with the provider endpoint")
+
+
+def _validate_model_entry_endpoint(
+    model_entry: Mapping[str, Any] | None, endpoint: str
+) -> None:
+    if model_entry is None:
+        return
+    options = model_entry.get("options")
+    if isinstance(options, Mapping) and options.get("baseURL") is not None:
+        _check_endpoint_override(options["baseURL"], endpoint, "model options.baseURL")
+    api = model_entry.get("api")
+    if isinstance(api, Mapping) and api.get("url") is not None:
+        _check_endpoint_override(api["url"], endpoint, "model api.url")
+
+
+def _validate_explicit_endpoint(raw: object, endpoint: str) -> None:
+    if raw is None:
+        return
+    if not isinstance(raw, str) or not raw.strip():
+        return
+    try:
+        normalized = _normalize_ollama_endpoint(raw)
+    except ValueError as error:
+        raise ProviderNotConfiguredError("OLLAMA_HOST is not a local loopback") from error
+    if normalized != endpoint:
+        raise ProviderNotConfiguredError(
+            "OLLAMA_HOST conflicts with the resolved provider endpoint"
+        )
+
+
+def _verify_deny_permission(permission: Any, label: str) -> None:
+    if not isinstance(permission, Mapping):
+        raise ProviderNotConfiguredError(f"resolved {label} is missing")
+    if permission.get("*") != "deny":
+        raise ProviderNotConfiguredError(f"resolved {label} is not deny-by-default")
+    # Every key and value must be a strict deny. An unknown tool, a pattern, a
+    # nested rule object, or an ``allow``/``ask`` value is ambiguous or a widening
+    # grant and must fail closed; the reviewer has no legitimate positive grant.
+    for tool, value in permission.items():
+        if value != "deny":
+            raise ProviderNotConfiguredError(
+                f"resolved {label} grants or leaves ambiguous permission for {tool}"
+            )
+
+
+def _verify_local_config_consistency(parsed: Mapping[str, Any], endpoint: str) -> None:
+    """Re-verify a resolved config after injecting the verified child config.
+
+    Confirms a higher-precedence (e.g. managed) override did not change the
+    transport, change or override the endpoint back to remote, widen
+    ``enabled_providers``, alter the reviewer steps, or re-introduce an ``allow``
+    permission on either the global or the agent permission layer.
+    """
+    if parsed["npm"] != "@ai-sdk/openai-compatible":
+        raise ProviderNotConfiguredError("resolved transport changed during configuration")
+    if parsed["endpoint"] != endpoint:
+        raise ProviderNotConfiguredError("resolved endpoint changed during configuration")
+    if parsed["enabled_providers"] != ("ollama",):
+        raise ProviderNotConfiguredError("resolved enabled_providers is not exactly ollama")
+    _verify_deny_permission(parsed["permission"], "global permission")
+    agent = parsed["agent"]
+    if not isinstance(agent, Mapping):
+        raise ProviderNotConfiguredError("resolved config lost the reviewer agent")
+    local_agent = agent.get("agentflow-local-ollama-reviewer")
+    if not isinstance(local_agent, Mapping):
+        raise ProviderNotConfiguredError("resolved config lost the local reviewer agent")
+    if local_agent.get("steps") != REMOTE_REVIEWER_MAX_STEPS:
+        raise ProviderNotConfiguredError("resolved reviewer steps changed")
+    _verify_deny_permission(local_agent.get("permission"), "agent permission")
+
+
+class LocalOllamaReviewerAdapter:
+    """Run a local Ollama reviewer with packet-only, read-only, no-tool isolation.
+
+    Ollama is modelled as a local provider (``is_local=True``). The adapter reuses the
+    exact packet-only execution path of the remote reviewer (fresh read-only temp dir,
+    all tools denied, JSON-only protocol, timeout/UNKNOWN/step-limit semantics) but the
+    cost is a confirmed local zero and the endpoint must be a deterministic loopback or
+    the call fails closed. Before any inference the resolved OpenCode configuration is
+    read (``opencode debug config --pure``) and the Ollama provider's base URL is
+    verified to be a local loopback; a remote or unverifiable endpoint is rejected.
+    It only serves ``review``/``rereview`` and enforces ``read_only=True``; it is never
+    a valid implementation/revision target.
+    """
+
+    provider = "ollama"
+
+    def __init__(
+        self,
+        *,
+        planned_models: Sequence[ModelRef] = (),
+        opencode_command: str | None = None,
+        timeout_seconds: int = 900,
+        discovery_timeout_seconds: int = 15,
+        ollama_host: str | None = None,
+        test_double: bool = False,
+    ) -> None:
+        for model in planned_models:
+            if model.provider != self.provider or not model.is_local:
+                raise ValueError(
+                    "planned local Ollama models must be the ollama provider and marked local"
+                )
+        self.planned_models = tuple(planned_models)
+        self.opencode_command = opencode_command or shutil.which("opencode") or "opencode"
+        self.timeout_seconds = timeout_seconds
+        self.discovery_timeout_seconds = discovery_timeout_seconds
+        self.test_double = test_double
+        self.adapter_id = "opencode-local-ollama-review"
+        # The explicitly requested endpoint (constructor argument first, then the
+        # OLLAMA_HOST environment). It is validated against the resolved OpenCode
+        # config at call time, never trusted from this snapshot alone.
+        self._ollama_host_raw = (
+            ollama_host if ollama_host is not None else os.environ.get("OLLAMA_HOST")
+        )
+
+    def _discover_model_ids(self) -> tuple[str, ...]:
+        return _discover_remote_model_ids(
+            self.provider,
+            self.opencode_command,
+            discovery_timeout_seconds=self.discovery_timeout_seconds,
+        )
+
+    def _resolve_ollama_config(
+        self,
+        model_id: str | None,
+        *,
+        review_root: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> dict[str, Any]:
+        """Read and validate the resolved OpenCode config for the Ollama provider."""
+        if review_root is not None:
+            text = _read_resolved_config(
+                self.opencode_command,
+                review_root,
+                self.discovery_timeout_seconds,
+                environment=environment,
+            )
+            parsed = _parse_resolved_ollama_config(text, model_id=model_id)
+            _validate_model_entry_endpoint(parsed["model_entry"], parsed["endpoint"])
+            _validate_explicit_endpoint(self._ollama_host_raw, parsed["endpoint"])
+            return parsed
+        with tempfile.TemporaryDirectory(prefix="agentflow-ollama-config-") as directory:
+            return self._resolve_ollama_config(
+                model_id, review_root=Path(directory), environment=environment
+            )
+
+    def _prepare_local_environment(
+        self, review_root: Path, environment: dict[str, str], model_id: str
+    ) -> None:
+        """Bind a verified loopback endpoint into the child process environment.
+
+        Reads the resolved config, verifies the endpoint and the selected model's
+        override, strips proxy variables, writes the verified endpoint and deny
+        config into ``OPENCODE_CONFIG_CONTENT``, and finally re-reads the resolved
+        config once more (at most two parses per invocation) to confirm a managed
+        override did not silently change the endpoint or re-add a permission.
+        """
+        parsed = self._resolve_ollama_config(model_id, review_root=review_root)
+        endpoint = parsed["endpoint"]
+        for key in (
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ):
+            environment.pop(key, None)
+        environment["NO_PROXY"] = "*"
+        environment["no_proxy"] = "*"
+        environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
+            _local_ollama_permission_config(
+                model_id=model_id,
+                endpoint=endpoint,
+                model_entry=parsed["model_entry"],
+            ),
+            separators=(",", ":"),
+        )
+        second = self._resolve_ollama_config(
+            model_id, review_root=review_root, environment=environment
+        )
+        _verify_local_config_consistency(second, endpoint)
+
+    def discover(self) -> Sequence[ModelRecord]:
+        # The resolved-config security validation runs outside the availability
+        # try/except so a remote or invalid endpoint is never swallowed.
+        self._resolve_ollama_config(None)
+        try:
+            discovered = set(self._discover_model_ids())
+        except ReviewerUnavailableError:
+            # Ollama is not reachable / has no configured models: report the true
+            # state (unavailable) rather than auto-starting, downloading or raising.
+            discovered = set()
+        refs = self.planned_models or tuple(
+            ModelRef(self.provider, model_id, model_id, None, True)
+            for model_id in sorted(discovered)
+        )
+        return tuple(
+            ModelRecord(
+                ref=model,
+                available=False,
+                context_length=None,
+                tool_capable=False,
+                input_cost_per_million=0,
+                output_cost_per_million=0,
+                measured_tokens_per_second=None,
+                trust_level=TrustLevel.UNVERIFIED,
+                highest_allowed_risk=BusinessImportance.NORMAL,
+                availability_state=(
+                    ModelAvailabilityState.DISCOVERABLE
+                    if model.model_id in discovered
+                    else ModelAvailabilityState.UNAVAILABLE
+                ),
+            )
+            for model in refs
+        )
+
+    def require_model(self, model: ModelRef) -> None:
+        if model.provider != self.provider or not model.is_local:
+            raise UnsupportedProviderError(
+                "local Ollama reviewer only accepts local ollama models"
+            )
+        self._resolve_ollama_config(model.model_id)
+        if model.model_id not in self._discover_model_ids():
+            raise ModelUnavailableError(
+                f"model unavailable: {self.provider}/{model.model_id}"
+            )
+
+    def invoke(self, request: InvocationRequest) -> InvocationResult:
+        if request.role not in {"review", "rereview"}:
+            raise ValueError(
+                "local Ollama role denied: only review and rereview are allowed"
+            )
+        if not request.read_only:
+            raise ValueError("local Ollama role denied: reviewer must be read-only")
+        self.require_model(request.model)
+        model_label = f"{self.provider}/{request.model.model_id}"
+        command_prefix = (
+            self.opencode_command,
+            "run",
+            "--format",
+            "json",
+            "--pure",
+            "--auto",
+            "--agent",
+            "agentflow-local-ollama-reviewer",
+            "--model",
+            model_label,
+        )
+        return _run_opencode_packet_review(
+            command_prefix=command_prefix,
+            config_content=json.dumps(self._permission_config(), separators=(",", ":")),
+            prompt=request.prompt,
+            timeout_seconds=self.timeout_seconds,
+            is_local=True,
+            review_label="local Ollama review",
+            model_label=model_label,
+            on_provider_request_id=request.metadata.get("on_provider_request_id"),
+            prepare_environment=lambda root, environment: self._prepare_local_environment(
+                root, environment, request.model.model_id
+            ),
+        )
+
+    def query(self, provider_request_id: str) -> InvocationResult | None:
+        return None
+
+    def cancel(self, provider_request_id: str) -> bool:
+        return OpenCodeAdapter().cancel(provider_request_id)
+
+    def _permission_config(self) -> dict[str, Any]:
+        permission = _reviewer_deny_permission()
+        return {
+            "$schema": "https://opencode.ai/config.json",
+            "enabled_providers": [self.provider],
+            "permission": permission,
+            "agent": {
+                "agentflow-local-ollama-reviewer": {
+                    "description": "Packet-only read-only local Ollama reviewer",
                     "mode": "primary",
                     "steps": REMOTE_REVIEWER_MAX_STEPS,
                     "permission": permission,
@@ -984,10 +1690,12 @@ def _scan_usage_events(data: bytes) -> dict[str, object]:
     output_tokens = 0
     reasoning_tokens = 0
     saw_reasoning = False
+    saw_input = False
+    saw_output = False
+    usage_incomplete = False
     provider_request_id: str | None = None
     event_count = 0
     completed_step_count = 0
-    saw_usage = False
     reported_cost = 0.0
     cost_reported = False
     cost_invalid = False
@@ -1008,15 +1716,23 @@ def _scan_usage_events(data: bytes) -> dict[str, object]:
         if str(event.get("type", "")) == "step_finish":
             completed_step_count += 1
         part = event.get("part") if isinstance(event.get("part"), Mapping) else event
-        tokens = part.get("tokens") if isinstance(part.get("tokens"), Mapping) else {}
-        in_tokens = _token_total(tokens.get("input"))
-        out_tokens = _token_total(tokens.get("output"))
-        if in_tokens or out_tokens:
-            saw_usage = True
-        input_tokens += in_tokens
-        output_tokens += out_tokens
-        reasoning = _token_total(tokens.get("reasoning"))
-        if reasoning:
+        tokens_raw = part.get("tokens")
+        tokens = tokens_raw if isinstance(tokens_raw, Mapping) else {}
+        in_tokens = _valid_token_value(tokens.get("input"))
+        out_tokens = _valid_token_value(tokens.get("output"))
+        if "input" in tokens and in_tokens is not None:
+            saw_input = True
+            input_tokens += in_tokens
+        if "output" in tokens and out_tokens is not None:
+            saw_output = True
+            output_tokens += out_tokens
+        if isinstance(tokens_raw, Mapping) or str(event.get("type", "")) == "step_finish":
+            if "input" not in tokens or in_tokens is None:
+                usage_incomplete = True
+            if "output" not in tokens or out_tokens is None:
+                usage_incomplete = True
+        reasoning = _valid_token_value(tokens.get("reasoning"))
+        if reasoning is not None and reasoning > 0:
             saw_reasoning = True
             reasoning_tokens += reasoning
         cost = part.get("cost", event.get("cost"))
@@ -1039,7 +1755,7 @@ def _scan_usage_events(data: bytes) -> dict[str, object]:
         "provider_request_id": provider_request_id,
         "event_count": event_count,
         "completed_step_count": completed_step_count,
-        "saw_usage": saw_usage,
+        "saw_usage": (saw_input and saw_output) and not usage_incomplete,
         "reported_cost": reported_cost,
         "cost_reported": cost_reported,
         "cost_invalid": cost_invalid,
@@ -1050,23 +1766,26 @@ def parse_opencode_partial_usage(
     data: bytes,
     *,
     duration_ms: int,
-    timeout_seconds: int,
+    timeout_seconds: int | None = None,
     cost_unavailable: bool = False,
     cleanup_incomplete: bool = False,
+    termination_reason: str = "timeout",
 ) -> InvocationResult:
     """Extract conservative usage evidence from partial OpenCode JSON events.
 
-    The output text is intentionally empty: a timed-out call has no confirmed
-    result. Each completed step reports its own token usage, so every real
-    token-bearing event in the merged stream is summed. Overlap between the two
-    reads is removed at the raw byte-stream level before decoding; events are
-    never de-duplicated by their content. For remote calls ``cost_unavailable``
-    marks the remote cost as unavailable rather than reporting a fabricated zero.
+    The output text is intentionally empty: a timed-out or otherwise interrupted
+    call has no confirmed result. Each completed step reports its own token usage,
+    so every real token-bearing event in the merged stream is summed. Overlap
+    between the two reads is removed at the raw byte-stream level before decoding;
+    events are never de-duplicated by their content. ``termination_reason`` records
+    the precise interruption cause (``timeout``, ``signal_terminated``,
+    ``interrupted`` or ``communication_error``); ``timeout_seconds`` is only
+    attached for a timeout. For remote calls ``cost_unavailable`` marks the remote
+    cost as unavailable rather than reporting a fabricated zero.
     """
     scan = _scan_usage_events(data)
-    metadata = {
-        "termination_reason": "timeout",
-        "timeout_seconds": timeout_seconds,
+    metadata: dict[str, Any] = {
+        "termination_reason": termination_reason,
         "token_source": (
             "opencode_json_events" if scan["saw_usage"] else "unavailable"
         ),
@@ -1082,6 +1801,8 @@ def parse_opencode_partial_usage(
         "cleanup_incomplete": cleanup_incomplete,
         "cost_invalid": scan["cost_invalid"],
     }
+    if timeout_seconds is not None:
+        metadata["timeout_seconds"] = timeout_seconds
     return InvocationResult(
         provider_request_id=scan["provider_request_id"],
         output="",
@@ -1167,6 +1888,9 @@ def parse_opencode_json(
     step_start_count = 0
     step_finish_count = 0
     tool_use_count = 0
+    saw_input = False
+    saw_output = False
+    usage_incomplete = False
     # The reason of the last step_finish event that carries one. A stream may
     # contain several step_finish events, so "terminal" means the final defined
     # reason, never the first intermediate one.
@@ -1209,10 +1933,27 @@ def parse_opencode_json(
             if reason is not None:
                 terminal_reason = reason
         tokens = part.get("tokens") if isinstance(part.get("tokens"), Mapping) else {}
-        input_tokens += _token_total(tokens.get("input"))
-        output_tokens += _token_total(tokens.get("output"))
-        reasoning = _token_total(tokens.get("reasoning"))
-        if reasoning:
+        in_tokens = _valid_token_value(tokens.get("input"))
+        out_tokens = _valid_token_value(tokens.get("output"))
+        # A token key with a valid (non-bool, non-negative) value -- including an
+        # explicit zero -- is confirmed usage. A missing key or an invalid value
+        # (string, null, bool, negative) is not credited and leaves that side unknown.
+        if "input" in tokens and in_tokens is not None:
+            saw_input = True
+            input_tokens += in_tokens
+        if "output" in tokens and out_tokens is not None:
+            saw_output = True
+            output_tokens += out_tokens
+        # Any token-carrying event (or a step_finish, which reports usage) with a
+        # missing or invalid input/output keeps the whole call's usage unavailable;
+        # a later valid event must not clear this.
+        if isinstance(part.get("tokens"), Mapping) or event_type == "step_finish":
+            if "input" not in tokens or in_tokens is None:
+                usage_incomplete = True
+            if "output" not in tokens or out_tokens is None:
+                usage_incomplete = True
+        reasoning = _valid_token_value(tokens.get("reasoning"))
+        if reasoning is not None and reasoning > 0:
             saw_reasoning = True
             reasoning_tokens += reasoning
         cost = part.get("cost", event.get("cost"))
@@ -1259,6 +2000,8 @@ def parse_opencode_json(
         "step_finish_count": step_finish_count,
         "tool_use_count": tool_use_count,
         "session_id": provider_request_id,
+        "token_source": "opencode_json_events" if ((saw_input and saw_output) and not usage_incomplete) else "unavailable",
+        "usage_unavailable": not ((saw_input and saw_output) and not usage_incomplete),
     }
     if configured_step_limit is not None:
         metadata["configured_step_limit"] = configured_step_limit
@@ -1514,12 +2257,31 @@ def _text_reports_step_limit(text: str) -> bool:
     return status == "confirmed"
 
 
-def _token_total(value: Any) -> int:
+def _valid_token_value(value: Any) -> int | None:
+    """Return a confirmed non-negative integer token count, or ``None`` if invalid.
+
+    ``bool`` is rejected even though it is an ``int`` subclass, as are negative
+    integers, floats, strings and ``None``. A ``Mapping`` (the project's existing
+    supported substructure) is summed only when every item is a non-bool
+    non-negative integer; any invalid item invalidates the whole count. The caller
+    distinguishes a confirmed zero from "no usage evidence" by the presence of the
+    token key, so a valid zero is never mislabelled as unknown and an invalid value
+    is never credited as consumption.
+    """
+    if isinstance(value, bool):
+        return None
     if isinstance(value, int):
+        if value < 0:
+            return None
         return value
     if isinstance(value, Mapping):
-        return sum(int(item) for item in value.values() if isinstance(item, int))
-    return 0
+        total = 0
+        for item in value.values():
+            if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+                return None
+            total += item
+        return total
+    return None
 
 
 def _find_string(value: Mapping[str, Any], keys: tuple[str, ...]) -> str | None:

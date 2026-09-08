@@ -74,6 +74,13 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - OpenCode 报告的远程费用按调用记录；未报告费用时记录 `cost_unavailable`，不伪造零。
 - configured/discoverable 只表示接入候选，不等于 `callable_verified`。真实 smoke test 必须使用另一个明确计划和哈希批准，本次开发任务不执行。
 
+### 2.8 本地 Ollama Reviewer
+
+- 本地 Ollama（`provider='ollama'`、`is_local=True`）仅承担 `review`/`rereview`；`implementation`/`revision` 等写角色、`read_only=false` 或非回环端点在推理进程启动前确定性拒绝。
+- 每次调用前重新读取并验证实际 OpenCode 有效配置（`opencode debug config --pure`），确认 `provider.ollama` 的 npm 为已验证 transport、`options.baseURL` 与所选模型条目端点均为严格回环；远程、冲突、非法或无法证明的端点失败关闭。
+- 验证后的回环端点与全 deny 配置写入子进程 `OPENCODE_CONFIG_CONTENT`，并移除代理变量、设置 `NO_PROXY='*'`；仅影响本地 Reviewer 子进程。
+- 本地 Ollama Reviewer 复用 packet-only 只读最小 prompt、全工具禁用、固定 steps=2 与 JSON-only 协议；费用为确认零远程费用。发现列表只产生 `discoverable`/`unavailable`，不提升为 `callable_verified`。
+
 ## 3. 明确不做
 
 - 网页控制台、手机端或云端控制平面；
@@ -126,12 +133,14 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 | MVP-A29 | 远程实施任务声明 `input_artifacts`，worktree 输入文件与哈希一致或不一致。 | 一致时 Worker 正常执行；任一文件缺失或哈希不一致时任务以 `input_artifact_mismatch` 失败，不进入模型调用。 | TASK-07 |
 | MVP-A30 | 同一审核输出在 `block_p0_p1` 与 `zero_findings` 两种 `review_acceptance_policy` 下分别评估。 | P2/P3 finding 在 `zero_findings` 下阻断批准，在 `block_p0_p1` 下不阻断；P0/P1 始终阻断。 | QA-12 |
 | MVP-A31 | 配置与未配置 `supervisor_policy` 唤醒事件，运行产生 P0/P1 finding 的任务。 | 配置时产生有界 `supervisor_checkpoints`，`supervisor-next` 读取、`supervisor-record` 确认、`supervisor_digest` 给出摘要且不调用模型；无论是否配置，一组强制唤醒事件（P0/P1 finding、UNKNOWN、超时/步骤/续接耗尽、会话不一致、范围/隐私/授权/网络违规、Reviewer 不可用/协议错误、费用未知、预算达限、终局等）始终被记录，空或窄 `wake_events` 只能额外增加可选唤醒原因，不能静默强制唤醒。 | CTRL-04, WAIT-02 |
+| MVP-A32 | 本地 Ollama 经 OpenCode 承担 `review`/`rereview`：验证回环端点、发现、角色与只读边界、packet/进程隔离、两层权限与费用。 | 回环/非法端点严格分类且不触发 DNS；远程/冲突/未知 transport 端点失败关闭且推理 `Popen`=0；无计划发现的 family 为 `None`；写角色与 `read_only=false` 在配置发现前拒绝；cwd/`--dir` 为临时只读目录；两层 `*` 及 read/glob/grep/edit/write/bash/shell/external_directory/webfetch/websearch/task/subagent/skill/question 均 deny、steps=2、仅 ollama；本地费用为确认零。 | PLAT-06, MODEL-14, MODEL-13, AUTH-04/05/07/09, COST-06, QA-03/08/09/12, STATE-05 |
+| MVP-A33 | 本地 Ollama 调用的失败、协议错误、UNKNOWN、恢复、独立性与授权边界。 | 正数非零退出/无可用结果为协议错误并保留 usage 与 `termination_reason`，不 fallback；超时/signal/KeyboardInterrupt 为 `UNKNOWN` 且保留已确认证据、resume 不重发；明确步骤耗尽为已知失败且不生成 review row；写角色 fallback 到 Ollama 时 LocalOllamaReviewerAdapter 从未被调用且暂停原因可追溯；provider/model_id/version/family/is_local 变化改变 plan_hash 并使旧授权失效。 | QA-08/09/12, STATE-03/05, AUTH-04/05/07/09 |
 
 ## 5. MVP 完成定义
 
 同时满足以下条件才算 MVP 通过：
 
-1. MVP-A01 至 MVP-A31 全部通过，且每项有非模型自述的可核查证据。
+1. MVP-A01 至 MVP-A33 全部通过，且每项有非模型自述的可核查证据。
 2. 没有未解决的 P0/P1 审核问题。
 3. 通用核心没有硬编码候选模型或金融规则。
 4. 未包含“明确不做”列表中的能力作为隐含依赖。
@@ -148,7 +157,7 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 
 ## 7. 验收结果
 
-MVP-A01 至 MVP-A31 均已通过。当前自动化证据由标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider smoke test，远程费用为 0。历史本地适配器验证保持不变。
+MVP-A01 至 MVP-A31 均已通过（历史记录）。MVP-A32 与 MVP-A33 为本次新增的本地 Ollama Reviewer 验收，已完成确定性替身验收，并于 2026-09-08 获 Codex 独立复核批准；证据见 `verification/2026-09-08-ollama-reviewer-codex-approval.md`。当前自动化证据由标准库测试提供；远程扩展只使用明确标记的 FakeAdapter、mock 进程和 stub OpenCode executable，未执行真实 provider smoke test，远程费用为 0。历史本地适配器验证保持不变。
 
 | 场景 | 结果 | 主要证据 |
 | --- | --- | --- |
@@ -183,3 +192,5 @@ MVP-A01 至 MVP-A31 均已通过。当前自动化证据由标准库测试提供
 | MVP-A29 | 通过 | 显式输入快照哈希一致放行、缺失或哈希不一致以 `input_artifact_mismatch` 失败且不进入模型调用测试 |
 | MVP-A30 | 通过 | `block_p0_p1` 与 `zero_findings` 两种策略下 P2/P3 阻断差异与 P0/P1 始终阻断测试 |
 | MVP-A31 | 通过 | `supervisor_checkpoints` 记录/读取/确认/摘要、内容截断、空/窄 `wake_events` 仍记录强制唤醒与 CLI `supervisor-next`/`supervisor-record` 测试 |
+| MVP-A32 | 确定性替身验收及 Codex 独立复核通过 | 回环/非法端点严格分类（无 DNS）、远程/冲突/未知 transport 失败关闭且 `Popen`=0、无计划 family=None、写角色/非只读前置拒绝、临时只读 cwd/`--dir`、两层全 deny + steps=2 + 仅 ollama、本地费用确认零 |
+| MVP-A33 | 确定性替身验收及 Codex 独立复核通过 | 非零退出/无结果协议错误保留 usage 且不 fallback、超时/signal 为 UNKNOWN 且 resume 不重发、步骤耗尽无 review row、写角色 fallback 到 Ollama 不调用本地 Reviewer 且暂停原因可追溯、计划字段变化使 plan_hash 失效；混合有效/无效使用量保留确认部分但标记不完整 |

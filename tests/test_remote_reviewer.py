@@ -316,7 +316,9 @@ class RemoteAdapterTests(unittest.TestCase):
             "subprocess.Popen", return_value=process
         ) as popen, mock.patch(
             "agentflow.opencode_adapter.OpenCodeAdapter.cancel", return_value=True
-        ), mock.patch("agentflow.opencode_adapter._bounded_drain", return_value=b""):
+        ), mock.patch(
+            "agentflow.opencode_adapter._bounded_drain", return_value=(b"", False)
+        ):
             with self.assertRaisesRegex(InvocationOutcomeUnknown, "outcome unknown"):
                 adapter.invoke(review_request())
         self.assertEqual(1, popen.call_count)
