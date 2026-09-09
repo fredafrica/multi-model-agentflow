@@ -208,7 +208,7 @@
 ### AD-38：实现步骤预算字段
 
 - 状态：已接受（Owner 于 2026-09-04 明确要求）
-- 决策：任务合同新增 `implementation_max_steps` 字段，为有限正整数并设置 1–32 硬上限；旧计划未提供时默认 8，保持向后兼容。字段进入 canonical 计划 JSON 与 SHA-256，改变字段使旧授权失效；Runner 将授权值写入本地 implementation 请求元数据，OpenCodeAdapter 从元数据读取并验证后写入 `agentflow-sandbox` 的 `steps`。远程 Reviewer 继续使用独立的固定安全步骤上限。
+- 决策：任务合同新增 `implementation_max_steps` 字段，为有限正整数并设置 1–32 硬上限；旧计划未提供时默认 8，保持向后兼容。字段进入 canonical 计划 JSON 与 SHA-256，改变字段使旧授权失效；Runner 将授权值写入本地 implementation 请求元数据，OpenCodeAdapter 从元数据读取并验证后写入 `agentflow-sandbox` 的 `steps`。远程 Reviewer 当时使用独立固定上限；此运行规则已由 AD-46 替代。
 - 影响：模型 context 与步骤预算是两个独立参数；本次不修改任何模型的 context。不得从环境变量、未授权 project config 或模型输出覆盖该值，也不得自动选择无限步骤。
 
 ### AD-39：本地实施调用超时
@@ -254,10 +254,46 @@
 ### AD-45：本地 Ollama 只读 Reviewer
 
 - 状态：已接受（Owner 原始任务要求本地 Ollama 经 OpenCode 承担仅审核路径；第 4–6 节实现细节来自 Codex 根据 Owner 于 2026-09-08 委托裁定的本次实现方案）
-- 决策：本地 Ollama（`provider='ollama'`、`is_local=True`）经 OpenCode 仅承担 `review`/`rereview`，复用 packet-only 只读最小 prompt、全工具禁用、固定 `steps=2` 与 JSON-only 协议，费用为确认零远程费用。写角色、`read_only=false` 或非回环端点在推理进程启动前确定性拒绝。
+- 决策：本地 Ollama（`provider='ollama'`、`is_local=True`）经 OpenCode 仅承担 `review`/`rereview`，复用 packet-only 只读最小 prompt、全工具禁用、固定 `steps=2`（已由 AD-46 替代）与 JSON-only 协议，费用为确认零远程费用。写角色、`read_only=false` 或非回环端点在推理进程启动前确定性拒绝。
 - 端点与配置绑定：每次调用前重新读取实际 OpenCode 有效配置（`opencode debug config --pure`），验证 `provider.ollama` 的 npm 为已验证 transport、`options.baseURL` 与所选模型条目端点均为严格回环；远程、冲突、非法或无法证明的端点失败关闭（fail-closed）。验证后的回环端点与全 deny 配置写入子进程 `OPENCODE_CONFIG_CONTENT`，并移除代理变量、设置 `NO_PROXY='*'`。不新增表/字段，`ollama_host` 属于适配器运行配置而非计划字段。
 - 模型元数据与角色边界：计划内 `ModelRef` 原样保留；无计划发现时 family 保持 `None`，不猜测为 `gpt-oss`。发现只产生 `discoverable`/`unavailable`，不提升为 `callable_verified`。`AdapterRouter` 对仅注册特定角色的 provider 在其他角色上失败关闭（`ReviewerUnavailableError`），Runner 保留原始拒绝原因并安全暂停。
 - 影响：该决定覆盖 AD-34/AD-41 的远程扩展范围限制，但不放宽授权、D0-D3、预算、UNKNOWN、幂等、费用、文件或副作用规则，也不授权本次开发任务进行真实模型调用。
+
+### AD-46：任务级审核步骤预算（BUG-RB-01）
+
+- 状态：已接受（Owner 于 2026-09-08 要求按资源预算交接计划修复；默认值与边界经本轮确定性验证定稿）。
+- 决策：`review_max_steps` 默认 8、范围 2–32。OpenCode 当前 steps 是最多 Agent 循环数，存在终止收尾轮；2 保留原受限选项，8 给 packet-only 审核有限余量，32 是工程防御上界而非模型事实。首轮完成可立即退出。
+- 传递：任务合同 → canonical JSON/hash → Runner/InvocationService → 各 Reviewer 配置与 Ollama 二次验证，均按请求局部传参；LM Studio review/rereview 同样使用审核预算。
+- 影响：明确替代 AD-38、AD-45 的“固定审核 steps=2”运行规则；实施与远程 Worker 步骤字段独立。审核不续接，步骤耗尽仍保持 AD-35/40 的失败、审计与恢复语义。既有有限超时保持，不新增 review timeout 合同。
+
+### AD-47：冻结输出能力、角色授权与调用配置（BUG-RB-02）
+
+- 状态：已接受（Owner 于 2026-09-08 授权本修复范围；当前 OpenCode 1.18.29 的配置/内嵌源码和无费用替身验证支持此方案）。
+- 合同：`ModelRecord` 末尾追加 `max_output_tokens`、`capability_source`、`capability_source_version`、可选 `api_model_id`，保留旧位置参数。`ModelCapabilitySnapshot` 保存精确 `ref`、独立的 `context_length`/`max_output_tokens`、`source`/`source_version`、可选 API 别名；`PlanContract.model_capabilities` 保存唯一快照列表，计划缺快照可读取和展示，但不能签发新授权。
+- 来源：优先显式注册表配置（registry_config），其次明确的 OpenCode catalog 资料（opencode_catalog），最后是用户显式提供可执行上界的保守策略（conservative_fallback）。`freeze_capability` 只冻结已有可信记录，不自动推断/查询/合并来源；模型列表、模型自述和 context 都不构成 output 证据。来源版本必须非空、至多 256 字符。发现状态不会因此变成 callable_verified。
+- 角色：implementation/revision 共用 `implementation_max_output_tokens`；review/rereview 共用 `review_max_output_tokens`；默认均为 16000，这是授权缺省值而非模型能力。所有 Token/context 字段严格正整数，最大 2^31−1 是跨 JSON/SQLite/运行时的有界资源防御值，不是永久模型输出上限。未知 context 保持未知；不从 context 推测 output。
+- 冻结规则：`effective=min(frozen capability, role authorization)`；fallback 使用自己的精确快照；续接重新从同一已授权计划与实际模型计算。能力、来源、别名、步骤或输出授权变化均改变哈希。执行时观察到更低 output/context 时拒绝（即便低值仍大于 role authorization）；catalog 来源在配置中消失也拒绝。更高能力不放大 effective。
+- OpenCode：同时写精确 provider/model 条目的 `limit.output` 与子进程 `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`，避免内置 32000 运行时默认截断。深度保留 model options、其他 limits 和已验证端点/权限；存在 API 别名时必须在快照显式绑定。解析后的 model 配置按规范 JSON 比较，避免浮点/布尔相等陷阱；检查 agent steps 严格整数与权限。未验证的 provider 输出/思考覆盖在进程前拒绝。当前最终参数路径只验证了 `@ai-sdk/openai-compatible`，其他 transport 安全停止，不擅自声称其 SDK 行为已验证。本机当前 Ollama/LM Studio/DeepSeek 都使用该 transport。
+- 审计与存储：复用 plans canonical JSON、tasks contract JSON 和 model_calls.request_scope_json.resource_budgets；不建第二注册表或新业务恢复通道。当前仓库没有 ModelRecord 专属持久注册表表，发现记录经 canonical 序列化与 `model_record_from_mapping` 往返；实际执行证据由计划内快照持久化。费用预留、实际 Token 和输出上限继续分离，不补造总 Token/推理 Token 算法。
+- 运行时兼容门禁：推理前核对 OpenCode 版本为已验证的 1.18.29；其他版本安全停止，需补充离线参数路径证据后显式更新支持范围。版本号不是二进制真实性证明；本次已检查二进制的 SHA-256 记录在验证报告中。
+- 旧计划：缺字段的计划可规范化读取（8/16000/16000/空快照），哈希因此变化，旧批准必然失效；不得原地改写历史 JSON/授权/调用。已保存的旧 ID/version 不能覆盖，重订计划需新 version 并重新展示哈希/授权。旧暂停 run 保留可读历史并拒绝旧授权恢复；后续业务重规划和既有产物重新审核由 Owner 独立安排，不自动迁移运行或重复调用。
+- 验收：实现者确定性检查不替代不同模型自测和独立审核；本轮无真实模型调用、无 API 费用、无提交/全局配置改动。证据见 `verification/2026-09-08-reviewer-resource-budgets.md`。
+
+### AD-48：输出额度耗尽与无文本失败保留证据
+
+- 状态：已接受（Owner 批准 A＋B 范围：失败分类、审计修复与确定性测试，不包含新的模型执行或预算调整）。
+- 共享解析器先提取使用量、会话与最终结束原因再判断结果。最终 `length` 优先分类为 `output_limit_reached`，用已有 `InvocationIncompleteError` 携带结果；有部分文本或合法审核 JSON 也不能成功。中间步骤 `length` 后确有最终 `stop` 与有效文本的流不按最终长度耗尽处理。
+- 无文本使用带结果的 `InvocationProtocolError`；LM Studio 非零退出也保存失败使用量。复用 `fail_call` 和原有表，不新增授权、存储或恢复通道。分类器版本为 3，不改历史记录。
+- Runner 区分 `review_output_limit_reached` / `implementation_output_limit_reached` / `model_output_invalid`。已落库的 `output_limit_reached` 或 `protocol_error` 在 resume 前阻断重发；既有协议错误一并遵守此保守规则。超时等 UNKNOWN 规则不变，不把不确定结果强行归类为已知失败。
+- 本轮不推断 provider 通用的 reasoning 计费算法、不改默认输出额度或 thinking 参数、不回填历史 0 Token、不核销旧 UNKNOWN。确定性检查不构成不同模型自测或独立审核批准。
+
+### AD-49：LM Studio 审核材料隔离与配置诊断
+
+- 状态：已接受（Owner 确认局部修复方案）。
+- LM Studio review/rereview 强制只读，复用 Reviewer 全工具 deny 规则；实际全局与所选 Agent 权限在推理前验证，不能依赖提示词禁止读取旧代码。实施/修订继续保留原文件权限，不新增合同字段、权限放行选项或存储通道。
+- 审核只以冻结材料为证据；缺少上下文应报告，不得读取工作树补充。工具权限约束不是 OS 沙箱承诺，真实复验须检查工具调用记录。
+- 两条 P3 按诊断改善处理：未验证版本提示已验证与实际版本；输出/思考覆盖提示配置项名称但不打印值。不放开未验证版本或 thinking 选项、不降低 zero_findings，也不据此宣称 P3 已获独立关闭。
+- 新代码与审核材料重新冻结后须重新展示哈希并获得批准；历史运行/授权/UNKNOWN 不变。不同模型独立自测仍为整体验收前置条件。
 
 ## 2. 原暂定、经实现验证后接受的决策
 

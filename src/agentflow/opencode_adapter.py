@@ -14,12 +14,16 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
+from .resource_budgets import validate_invocation_budgets
+from .serialization import canonical_json
 
 from .adapters import (
     InvocationIncompleteError,
+    InvocationProtocolError,
     InvocationOutcomeUnknown,
     ModelUnavailableError,
     ProviderNotConfiguredError,
@@ -30,6 +34,8 @@ from .adapters import (
 )
 from .contracts import (
     DEFAULT_IMPLEMENTATION_MAX_STEPS,
+    DEFAULT_REVIEW_MAX_STEPS,
+    REVIEW_MAX_STEPS_LIMIT,
     DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
     DEFAULT_REMOTE_WORKER_MAX_STEPS,
     DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS,
@@ -50,8 +56,8 @@ from .contracts import (
     validate_provider_id,
 )
 
-# One normal reviewer response turn plus OpenCode's bounded finalization turn.
-REMOTE_REVIEWER_MAX_STEPS = 2
+# Legacy import compatibility only; invocation budgets come from the request.
+REMOTE_REVIEWER_MAX_STEPS = DEFAULT_REVIEW_MAX_STEPS
 
 
 class OpenCodeAdapter:
@@ -94,7 +100,7 @@ class OpenCodeAdapter:
                 ModelRecord(
                     ref=ModelRef("lmstudio", model_id, version, family, True),
                     available=item.get("status") in {"idle", "generating"},
-                    context_length=_optional_int(item.get("contextLength")),
+                    context_length=item.get("contextLength"),
                     tool_capable=bool(item.get("trainedForToolUse", False)),
                     input_cost_per_million=0,
                     output_cost_per_million=0,
@@ -115,17 +121,22 @@ class OpenCodeAdapter:
             raise ValueError("OpenCodeAdapter only permits the local lmstudio provider")
         if not request.model.is_local:
             raise ValueError("lmstudio models must be marked local")
+        if request.role in {"review", "rereview"} and not request.read_only:
+            raise ValueError("LM Studio review requires read_only=true")
         worktree = Path(str(request.metadata["worktree"])).resolve()
         if not worktree.is_dir():
             raise ValueError("invocation worktree does not exist")
-        steps = _implementation_steps(request.metadata)
+        steps = (_review_steps(request.metadata) if request.role in {"review", "rereview"}
+                 else _implementation_steps(request.metadata))
         timeout_seconds = _implementation_timeout(request.metadata)
+        output_budget = validate_invocation_budgets(request)
         prompt = self._bounded_prompt(request)
         environment = os.environ.copy()
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
             self._permission_config(read_only=request.read_only, steps=steps),
             separators=(",", ":"),
         )
+        _prepare_output_environment(self.opencode_command, worktree, environment, request, output_budget)
         command = [
             self.opencode_command,
             "run",
@@ -193,9 +204,17 @@ class OpenCodeAdapter:
                 if session_id is not None:
                     _verify_session_reuse(session_id, error.result)
                 raise
+            except InvocationProtocolError:
+                raise
             except RuntimeError:
                 pass
-            raise RuntimeError(stderr.strip() or "OpenCode invocation failed")
+            failed_usage = parse_opencode_failed_usage(
+                _as_output_bytes(stdout), duration_ms=duration_ms, is_local=True,
+                termination_reason="nonzero_exit",
+            )
+            raise InvocationProtocolError(
+                stderr.strip() or "OpenCode invocation failed", result=failed_usage
+            )
         result = parse_opencode_json(
             stdout,
             duration_ms=duration_ms,
@@ -248,6 +267,8 @@ class OpenCodeAdapter:
             "skill": "deny",
             "question": "deny",
         }
+        if read_only:
+            permission = _reviewer_deny_permission()
         return {
             "$schema": "https://opencode.ai/config.json",
             "enabled_providers": ["lmstudio"],
@@ -266,7 +287,8 @@ class OpenCodeAdapter:
     def _bounded_prompt(request: InvocationRequest) -> str:
         allowed = "\n".join(f"- {item}" for item in request.metadata.get("allowed_files", ()))
         mode = (
-            "Read-only review. Do not modify any file."
+            "Packet-only read-only review. All tools are disabled. "
+            "Review only the supplied material; report missing evidence without reading files."
             if request.read_only
             else f"You may edit only these project-relative files:\n{allowed}"
         )
@@ -498,6 +520,7 @@ def _run_opencode_packet_review(
     is_local: bool,
     review_label: str,
     model_label: str = "",
+    configured_steps: int = DEFAULT_REVIEW_MAX_STEPS,
     on_provider_request_id=None,
     prepare_environment: Callable[[Path, dict[str, str]], None] | None = None,
 ) -> InvocationResult:
@@ -610,7 +633,8 @@ def _run_opencode_packet_review(
         if process.returncode:
             try:
                 parse_opencode_json(
-                    stdout, duration_ms=duration_ms, is_local=is_local
+                    stdout, duration_ms=duration_ms, is_local=is_local,
+                    configured_step_limit=configured_steps,
                 )
             except InvocationIncompleteError:
                 raise
@@ -628,7 +652,8 @@ def _run_opencode_packet_review(
             )
         try:
             return parse_opencode_json(
-                stdout, duration_ms=duration_ms, is_local=is_local
+                stdout, duration_ms=duration_ms, is_local=is_local,
+                configured_step_limit=configured_steps,
             )
         except InvocationIncompleteError:
             raise
@@ -720,6 +745,8 @@ class RemoteOpenCodeReviewerAdapter:
             raise ValueError("remote role denied: only review and rereview are allowed")
         if not request.read_only:
             raise ValueError("remote role denied: reviewer must be read-only")
+        steps = _review_steps(request.metadata)
+        output_budget = validate_invocation_budgets(request)
         self.require_model(request.model)
         model_label = f"{self.provider}/{request.model.model_id}"
         command_prefix = (
@@ -737,14 +764,18 @@ class RemoteOpenCodeReviewerAdapter:
         return _run_opencode_packet_review(
             command_prefix=command_prefix,
             config_content=json.dumps(
-                self._permission_config(), separators=(",", ":")
+                self._permission_config(steps=steps), separators=(",", ":")
             ),
             prompt=request.prompt,
             timeout_seconds=self.timeout_seconds,
             is_local=False,
             review_label="remote OpenCode review",
+            configured_steps=steps,
             model_label=model_label,
             on_provider_request_id=request.metadata.get("on_provider_request_id"),
+            prepare_environment=lambda root, environment: _prepare_output_environment(
+                self.opencode_command, root, environment, request, output_budget
+            ),
         )
 
     def query(self, provider_request_id: str) -> InvocationResult | None:
@@ -753,7 +784,7 @@ class RemoteOpenCodeReviewerAdapter:
     def cancel(self, provider_request_id: str) -> bool:
         return OpenCodeAdapter().cancel(provider_request_id)
 
-    def _permission_config(self) -> dict[str, Any]:
+    def _permission_config(self, *, steps: int = DEFAULT_REVIEW_MAX_STEPS) -> dict[str, Any]:
         permission = {
             "*": "deny",
             "read": "deny",
@@ -779,7 +810,7 @@ class RemoteOpenCodeReviewerAdapter:
                 "agentflow-remote-reviewer": {
                     "description": "Packet-only read-only AgentFlow reviewer",
                     "mode": "primary",
-                    "steps": REMOTE_REVIEWER_MAX_STEPS,
+                    "steps": steps,
                     "permission": permission,
                 }
             },
@@ -810,7 +841,8 @@ def _reviewer_deny_permission() -> dict[str, Any]:
 
 
 def _local_ollama_permission_config(
-    *, model_id: str, endpoint: str, model_entry: Mapping[str, Any] | None
+    *, model_id: str, endpoint: str, model_entry: Mapping[str, Any] | None,
+    steps: int = DEFAULT_REVIEW_MAX_STEPS,
 ) -> dict[str, Any]:
     """Build the child config that binds a verified loopback Ollama endpoint.
 
@@ -840,7 +872,7 @@ def _local_ollama_permission_config(
             "agentflow-local-ollama-reviewer": {
                 "description": "Packet-only read-only local Ollama reviewer",
                 "mode": "primary",
-                "steps": REMOTE_REVIEWER_MAX_STEPS,
+                "steps": steps,
                 "permission": permission,
             }
         },
@@ -998,7 +1030,10 @@ def _verify_deny_permission(permission: Any, label: str) -> None:
             )
 
 
-def _verify_local_config_consistency(parsed: Mapping[str, Any], endpoint: str) -> None:
+def _verify_local_config_consistency(
+    parsed: Mapping[str, Any], endpoint: str, *, steps: int = DEFAULT_REVIEW_MAX_STEPS,
+    output_budget: Mapping[str, Any] | None = None,
+) -> None:
     """Re-verify a resolved config after injecting the verified child config.
 
     Confirms a higher-precedence (e.g. managed) override did not change the
@@ -1019,9 +1054,17 @@ def _verify_local_config_consistency(parsed: Mapping[str, Any], endpoint: str) -
     local_agent = agent.get("agentflow-local-ollama-reviewer")
     if not isinstance(local_agent, Mapping):
         raise ProviderNotConfiguredError("resolved config lost the local reviewer agent")
-    if local_agent.get("steps") != REMOTE_REVIEWER_MAX_STEPS:
+    if type(local_agent.get("steps")) is not int or local_agent["steps"] != steps:
         raise ProviderNotConfiguredError("resolved reviewer steps changed")
     _verify_deny_permission(local_agent.get("permission"), "agent permission")
+    if output_budget is not None:
+        entry = parsed.get("model_entry")
+        limit = entry.get("limit") if isinstance(entry, Mapping) else None
+        if not isinstance(limit, Mapping) or type(limit.get("output")) is not int or limit["output"] != output_budget["effective_max_output_tokens"]:
+            raise ProviderNotConfiguredError("resolved Ollama output budget changed")
+        context = output_budget["capability"]["context_length"]
+        if context is not None and (type(limit.get("context")) is not int or limit["context"] != context):
+            raise ProviderNotConfiguredError("resolved Ollama context changed")
 
 
 class LocalOllamaReviewerAdapter:
@@ -1100,7 +1143,9 @@ class LocalOllamaReviewerAdapter:
             )
 
     def _prepare_local_environment(
-        self, review_root: Path, environment: dict[str, str], model_id: str
+        self, review_root: Path, environment: dict[str, str], model_id: str,
+        *, steps: int = DEFAULT_REVIEW_MAX_STEPS,
+        request: InvocationRequest | None = None,
     ) -> None:
         """Bind a verified loopback endpoint into the child process environment.
 
@@ -1128,13 +1173,24 @@ class LocalOllamaReviewerAdapter:
                 model_id=model_id,
                 endpoint=endpoint,
                 model_entry=parsed["model_entry"],
+                steps=steps,
             ),
             separators=(",", ":"),
         )
         second = self._resolve_ollama_config(
             model_id, review_root=review_root, environment=environment
         )
-        _verify_local_config_consistency(second, endpoint)
+        _verify_local_config_consistency(second, endpoint, steps=steps)
+        if request is not None:
+            resolved = _prepare_output_environment(
+                self.opencode_command, review_root, environment,
+                request, validate_invocation_budgets(request),
+            )
+            final = _parse_resolved_ollama_config(canonical_json(resolved), model_id=model_id)
+            _validate_model_entry_endpoint(final["model_entry"], endpoint)
+            _validate_explicit_endpoint(self._ollama_host_raw, endpoint)
+            _verify_local_config_consistency(final, endpoint, steps=steps,
+                                            output_budget=validate_invocation_budgets(request))
 
     def discover(self) -> Sequence[ModelRecord]:
         # The resolved-config security validation runs outside the availability
@@ -1188,6 +1244,8 @@ class LocalOllamaReviewerAdapter:
             )
         if not request.read_only:
             raise ValueError("local Ollama role denied: reviewer must be read-only")
+        steps = _review_steps(request.metadata)
+        validate_invocation_budgets(request)
         self.require_model(request.model)
         model_label = f"{self.provider}/{request.model.model_id}"
         command_prefix = (
@@ -1204,15 +1262,16 @@ class LocalOllamaReviewerAdapter:
         )
         return _run_opencode_packet_review(
             command_prefix=command_prefix,
-            config_content=json.dumps(self._permission_config(), separators=(",", ":")),
+            config_content=json.dumps(self._permission_config(steps=steps), separators=(",", ":")),
             prompt=request.prompt,
             timeout_seconds=self.timeout_seconds,
             is_local=True,
             review_label="local Ollama review",
+            configured_steps=steps,
             model_label=model_label,
             on_provider_request_id=request.metadata.get("on_provider_request_id"),
             prepare_environment=lambda root, environment: self._prepare_local_environment(
-                root, environment, request.model.model_id
+                root, environment, request.model.model_id, steps=steps, request=request
             ),
         )
 
@@ -1222,7 +1281,7 @@ class LocalOllamaReviewerAdapter:
     def cancel(self, provider_request_id: str) -> bool:
         return OpenCodeAdapter().cancel(provider_request_id)
 
-    def _permission_config(self) -> dict[str, Any]:
+    def _permission_config(self, *, steps: int = DEFAULT_REVIEW_MAX_STEPS) -> dict[str, Any]:
         permission = _reviewer_deny_permission()
         return {
             "$schema": "https://opencode.ai/config.json",
@@ -1232,7 +1291,7 @@ class LocalOllamaReviewerAdapter:
                 "agentflow-local-ollama-reviewer": {
                     "description": "Packet-only read-only local Ollama reviewer",
                     "mode": "primary",
-                    "steps": REMOTE_REVIEWER_MAX_STEPS,
+                    "steps": steps,
                     "permission": permission,
                 }
             },
@@ -1315,6 +1374,7 @@ class RemoteOpenCodeWorkerAdapter:
             raise ValueError("remote role denied: only implementation and revision are allowed")
         if request.read_only:
             raise ValueError("remote role denied: implementation must be a write role")
+        output_budget = validate_invocation_budgets(request)
         self.require_model(request.model)
         worktree = Path(str(request.metadata["worktree"])).resolve()
         if not worktree.is_dir():
@@ -1327,6 +1387,7 @@ class RemoteOpenCodeWorkerAdapter:
         environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(
             self._permission_config(steps=steps), separators=(",", ":")
         )
+        _prepare_output_environment(self.opencode_command, worktree, environment, request, output_budget)
         command = (
             self.opencode_command,
             "run",
@@ -1474,6 +1535,143 @@ class RemoteOpenCodeWorkerAdapter:
                 }
             },
         }
+
+
+def _selected_output_model(config: Mapping[str, Any], request: InvocationRequest) -> tuple[dict, dict]:
+    try:
+        provider = config["provider"][request.model.provider]
+        model = provider["models"][request.model.model_id]
+    except (KeyError, TypeError) as error:
+        raise ProviderNotConfiguredError("selected output model configuration is missing") from error
+    if not isinstance(provider, dict) or not isinstance(model, dict):
+        raise ProviderNotConfiguredError("selected output configuration is invalid")
+    return provider, model
+
+
+def _reject_output_overrides(value: Any) -> None:
+    # Provider options can override generation arguments after the generic limit.
+    # Unknown token/thinking overrides cannot be proven within the authorization.
+    if isinstance(value, Mapping):
+        for key, item in value.items():
+            normalized = str(key).lower().replace("_", "")
+            if ((normalized.startswith("max") and "token" in normalized)
+                    or any(word in normalized for word in ("maxoutput", "numpredict", "budgettoken", "thinking"))):
+                label = re.sub(r"[^a-zA-Z0-9_.-]", "?", str(key))[:64]
+                raise ProviderNotConfiguredError(
+                    f"unverified provider output/reasoning override: {label}; "
+                    "including disabled thinking options; values are not logged"
+                )
+            _reject_output_overrides(item)
+    elif isinstance(value, (list, tuple)):
+        for item in value:
+            _reject_output_overrides(item)
+
+
+def _read_output_config(command: str, root: Path, timeout: int, *, environment: dict[str, str]) -> str:
+    try:
+        version = subprocess.run(
+            (command, "--version"), cwd=str(root), capture_output=True, text=True,
+            check=False, timeout=timeout, env=environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ProviderNotConfiguredError("OpenCode output-control version cannot be verified") from error
+    if version.returncode or version.stdout.strip() != "1.18.29":
+        found = version.stdout.strip()
+        if version.returncode or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?", found) or len(found) > 64:
+            found = "unknown or invalid"
+        raise ProviderNotConfiguredError(
+            f"OpenCode output-control version is unverified: verified=1.18.29, found={found}"
+        )
+    return _read_resolved_config(command, root, timeout, environment=environment)
+
+
+def _prepare_output_environment(command: str, root: Path, environment: dict[str, str],
+                                request: InvocationRequest, budget: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind both OpenCode limits and verify the resolved child config without logging it."""
+    overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+    try:
+        base = json.loads(_read_output_config(command, root, 15, environment=environment))
+    except (ValueError, TypeError) as error:
+        raise ProviderNotConfiguredError("output configuration cannot be resolved") from error
+    provider, model = _selected_output_model(base, request)
+    # This transport's final max_tokens mapping was verified in OpenCode 1.18.29.
+    # Other SDKs may add reasoning tokens or override generation arguments; do not
+    # claim enforcement for an unverified transport merely because it accepts JSON.
+    if (provider.get("npm") != "@ai-sdk/openai-compatible"
+            or model.get("npm", provider["npm"]) != provider["npm"]):
+        raise ProviderNotConfiguredError("output limit enforcement is unverified for this transport")
+    expected_api_id = budget["capability"].get("api_model_id") or request.model.model_id
+    if model.get("id", request.model.model_id) != expected_api_id:
+        raise ProviderNotConfiguredError("model API alias differs from frozen capability")
+    _reject_output_overrides(provider.get("options", {}))
+    _reject_output_overrides(model.get("options", {}))
+    _reject_output_overrides(model.get("variants", {}))
+    agents = base.get("agent", {})
+    if not isinstance(agents, Mapping):
+        raise ProviderNotConfiguredError("invalid resolved agents")
+    for agent in agents.values():
+        _reject_output_overrides(agent.get("options", {}) if isinstance(agent, dict) else {})
+    limit = model.get("limit", {})
+    if not isinstance(limit, dict):
+        raise ProviderNotConfiguredError("invalid resolved model limits")
+    # Explicit registry evidence may fill an unknown catalog output, but a smaller
+    # currently declared capability is never silently ignored.
+    current = limit.get("output")
+    effective = budget["effective_max_output_tokens"]
+    if current is not None and (type(current) is not int or current < budget["capability"]["max_output_tokens"]):
+        raise ProviderNotConfiguredError("model output capability decreased or is invalid")
+    if current is None and budget["capability"]["source"] == "opencode_catalog":
+        raise ProviderNotConfiguredError("catalog output capability source is unavailable")
+    context = budget["capability"]["context_length"]
+    if "context" in limit and (type(limit["context"]) is not int or limit["context"] <= 0):
+        raise ProviderNotConfiguredError("invalid resolved model context")
+    if context is not None and limit.get("context", context) < context:
+        raise ProviderNotConfiguredError("model context capability decreased")
+    selected = deepcopy(model)
+    selected["limit"] = {**limit, "output": effective}
+    if context is not None:
+        selected["limit"]["context"] = context
+    overlay.setdefault("provider", {}).setdefault(request.model.provider, {}).setdefault("models", {})[request.model.model_id] = selected
+    environment["OPENCODE_CONFIG_CONTENT"] = json.dumps(overlay, separators=(",", ":"))
+    environment["OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX"] = str(effective)
+    try:
+        resolved = json.loads(_read_output_config(command, root, 15, environment=environment))
+    except (ValueError, TypeError) as error:
+        raise ProviderNotConfiguredError("output configuration cannot be verified") from error
+    final_provider, final_model = _selected_output_model(resolved, request)
+    if canonical_json(final_model) != canonical_json(selected):
+        raise ProviderNotConfiguredError("resolved output model configuration changed")
+    for key in ("npm", "options"):
+        if final_provider.get(key) != provider.get(key):
+            raise ProviderNotConfiguredError("resolved provider transport/options changed")
+    if resolved.get("enabled_providers") != overlay["enabled_providers"]:
+        raise ProviderNotConfiguredError("resolved provider scope changed")
+    if request.role in ("review", "rereview"):
+        _verify_deny_permission(resolved.get("permission"), "global permission")
+    elif resolved.get("permission") != overlay["permission"]:
+        raise ProviderNotConfiguredError("resolved permissions changed")
+    final_agents = resolved.get("agent", {})
+    if not isinstance(final_agents, Mapping):
+        raise ProviderNotConfiguredError("invalid resolved agents")
+    expected_model = f"{request.model.provider}/{request.model.model_id}"
+    for name, expected in overlay["agent"].items():
+        actual = final_agents.get(name, {})
+        if not isinstance(actual, Mapping):
+            raise ProviderNotConfiguredError("invalid resolved agent")
+        if actual.get("model", expected_model) != expected_model:
+            raise ProviderNotConfiguredError("resolved agent model changed")
+        _reject_output_overrides(actual)
+        if (type(actual.get("steps")) is not int or actual["steps"] != expected["steps"]
+                or actual.get("permission") != expected["permission"]):
+            raise ProviderNotConfiguredError("resolved agent budget/permissions changed")
+    return resolved
+
+
+def _review_steps(metadata: Mapping[str, Any]) -> int:
+    value = metadata.get("review_max_steps", DEFAULT_REVIEW_MAX_STEPS)
+    if type(value) is not int or not 2 <= value <= REVIEW_MAX_STEPS_LIMIT:
+        raise ValueError("review_max_steps must be an integer between 2 and 32")
+    return value
 
 
 def _implementation_steps(metadata: Mapping[str, Any]) -> int:
@@ -1969,13 +2167,13 @@ def parse_opencode_json(
                     cost_reported = True
 
     output = "".join(output_parts).strip()
-    if not output and not structured_step_limit:
-        raise RuntimeError("OpenCode returned no text event")
-
     text_status, matched_rule_id, matched_line = (
         _text_step_limit_signal(output_parts) if output_parts else (None, None, None)
     )
-    if structured_step_limit:
+    if terminal_reason == "length":
+        termination_source = "structured_event"
+        failure_kind = "output_limit_reached"
+    elif structured_step_limit:
         termination_source = "structured_event"
         failure_kind = "step_limit_reached"
     elif text_status == "confirmed":
@@ -2026,6 +2224,11 @@ def parse_opencode_json(
         raw_metadata=metadata,
         cost_unavailable=not is_local and not cost_usable,
     )
+    if failure_kind == "output_limit_reached":
+        raise InvocationIncompleteError(
+            "OpenCode reached its output limit before completing the invocation",
+            result, failure_kind="output_limit_reached",
+        )
     if failure_kind == "step_limit_reached":
         raise InvocationIncompleteError(
             "OpenCode reached its maximum step limit before completing the invocation",
@@ -2039,6 +2242,9 @@ def parse_opencode_json(
             result,
             failure_kind="suspected_step_limit",
         )
+    if not output:
+        metadata["termination_reason"] = "no_text"
+        raise InvocationProtocolError("OpenCode returned no text event", result=result)
     return result
 
 
@@ -2110,7 +2316,7 @@ _STEP_LIMIT_MARKER_BODY_RE = re.compile(
 # Bumped whenever the termination classifier changes shape. Recorded in the
 # invocation metadata so a stored result can be traced back to the rules that
 # produced it.
-_CLASSIFIER_VERSION = "2"
+_CLASSIFIER_VERSION = "3"
 
 # Real, verified whole lines observed from OpenCode long tasks. Each maps the
 # exact lowercased line to a stable classifier rule ID. Only these two lines may

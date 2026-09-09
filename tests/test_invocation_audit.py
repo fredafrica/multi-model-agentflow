@@ -26,6 +26,7 @@ from agentflow.database import Database
 from agentflow.fake_adapter import FakeAdapter
 from agentflow.service import InvocationContext, InvocationService
 from agentflow.states import InvocationState, TaskState
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def _remote_task() -> TaskContract:
@@ -51,7 +52,7 @@ def _remote_task() -> TaskContract:
 
 
 def _remote_plan(task: TaskContract | None = None) -> PlanContract:
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="audit-plan",
         schema_version=1,
         version=1,

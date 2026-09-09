@@ -51,7 +51,7 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 支持安全暂停、立即冻结、人工接管和恢复。一次外部进程或模型请求是安全暂停的最小不可中断单元；返回后在下一次调用前保存检查点。
 - 重启恢复执行幂等检查：已完成任务和已完成收费调用不重复。
 - 步骤上限耗尽作为带原因的已知失败，保留 Token、耗时和已确认费用；实施结果不进入自测/审核，Reviewer 结果不产生 review 记录，两者均安全暂停且不自动重试。无论进程退出码为 0 还是正数非零，只要 stdout 事件流包含严格步骤耗尽信号即按此处理；signal 终止或结果不可确认仍保持 `UNKNOWN`。
-- 本地实施任务通过任务合同的 `implementation_max_steps` 字段携带有限步骤预算（缺省 8，允许 1–32，进入计划哈希与授权）。远程 Reviewer 继续使用独立的固定安全步骤上限，不因该字段放宽。
+- 本地实施任务通过任务合同的 `implementation_max_steps` 字段携带有限步骤预算（缺省 8，允许 1–32，进入计划哈希与授权）。所有 review/rereview 路径使用独立的 `review_max_steps`（缺省 8，2–32），具体规则见 AD-46。
 - 本地实施任务通过任务合同的 `implementation_timeout_seconds` 字段携带墙钟超时（缺省 900，允许 60–14400，进入计划哈希与授权）。超时后终止进程组并记为 `UNKNOWN`，保留部分输出中已确认的 Token、耗时与 OpenCode 会话 ID 等审计证据，`output_text` 保持空且不自动重试/自测/审核。
 - 本地实施任务通过任务合同的 `implementation_max_continuations` 字段携带续接预算（缺省 0，允许 0–8，进入计划哈希与授权）。本地 implementation/revision 调用因步骤耗尽而已知失败时，仅在本地模型、同一模型与 worktree/文件范围、续接限额内、文件范围核验通过且非 `UNKNOWN`/超时/signal/费用未知的前提下，以同一 OpenCode 会话的新 segment 续接；每个 segment 拥有唯一 call_id/request_key/segment_index/continuation_of_call_id 并单独记录 Token/耗时/费用，续接决定以 `continuation.scheduled` 事件持久化。远程只读 Reviewer 永不续接；segment 间进程重启后 resume 只续接一次且不重复已完成 segment。多轮修订由 `max_retry_count` 驱动（impl→test→fix→retest）。
 - 收费调用结果未知时先按请求 ID 查询；无法确认则进入 `UNKNOWN` 并暂停，不自动重试。
@@ -79,7 +79,17 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - 本地 Ollama（`provider='ollama'`、`is_local=True`）仅承担 `review`/`rereview`；`implementation`/`revision` 等写角色、`read_only=false` 或非回环端点在推理进程启动前确定性拒绝。
 - 每次调用前重新读取并验证实际 OpenCode 有效配置（`opencode debug config --pure`），确认 `provider.ollama` 的 npm 为已验证 transport、`options.baseURL` 与所选模型条目端点均为严格回环；远程、冲突、非法或无法证明的端点失败关闭。
 - 验证后的回环端点与全 deny 配置写入子进程 `OPENCODE_CONFIG_CONTENT`，并移除代理变量、设置 `NO_PROXY='*'`；仅影响本地 Reviewer 子进程。
-- 本地 Ollama Reviewer 复用 packet-only 只读最小 prompt、全工具禁用、固定 steps=2 与 JSON-only 协议；费用为确认零远程费用。发现列表只产生 `discoverable`/`unavailable`，不提升为 `callable_verified`。
+- 本地 Ollama Reviewer 复用 packet-only 只读最小 prompt、全工具禁用、任务授权的 `review_max_steps` 与 JSON-only 协议；费用为确认零远程费用。发现列表只产生 `discoverable`/`unavailable`，不提升为 `callable_verified`。
+
+### 2.9 角色输出授权与冻结能力
+
+- implementation/revision 和 review/rereview 分别使用独立角色输出授权；所有主模型与 fallback 在批准前须有计划内精确能力快照及来源/版本，context/output 独立。
+- 具体默认值、严格类型、冻结/拒绝能力下降、API 别名与旧计划处理只以 AD-47 为准；OpenCode 的模型输出和运行时上限同时绑定到本次 effective 值。
+- 当前验证的 OpenAI-compatible transport 覆盖本机四条适配器路径；未验证 transport/输出覆盖安全停止。所有已知失败和 UNKNOWN 沿既有审计/恢复路径保存预算证据。
+
+### 2.10 LM Studio 审核材料隔离
+
+- LM Studio review/rereview 使用 packet-only 全工具禁用规则，实际全局与 Agent 权限必须在推理前复核；实现/修订权限不变，详见 QA-14、AD-49。
 
 ## 3. 明确不做
 
@@ -133,14 +143,27 @@ macOS 系统通知是可选增强，不得成为验收前置条件。复杂的�
 | MVP-A29 | 远程实施任务声明 `input_artifacts`，worktree 输入文件与哈希一致或不一致。 | 一致时 Worker 正常执行；任一文件缺失或哈希不一致时任务以 `input_artifact_mismatch` 失败，不进入模型调用。 | TASK-07 |
 | MVP-A30 | 同一审核输出在 `block_p0_p1` 与 `zero_findings` 两种 `review_acceptance_policy` 下分别评估。 | P2/P3 finding 在 `zero_findings` 下阻断批准，在 `block_p0_p1` 下不阻断；P0/P1 始终阻断。 | QA-12 |
 | MVP-A31 | 配置与未配置 `supervisor_policy` 唤醒事件，运行产生 P0/P1 finding 的任务。 | 配置时产生有界 `supervisor_checkpoints`，`supervisor-next` 读取、`supervisor-record` 确认、`supervisor_digest` 给出摘要且不调用模型；无论是否配置，一组强制唤醒事件（P0/P1 finding、UNKNOWN、超时/步骤/续接耗尽、会话不一致、范围/隐私/授权/网络违规、Reviewer 不可用/协议错误、费用未知、预算达限、终局等）始终被记录，空或窄 `wake_events` 只能额外增加可选唤醒原因，不能静默强制唤醒。 | CTRL-04, WAIT-02 |
-| MVP-A32 | 本地 Ollama 经 OpenCode 承担 `review`/`rereview`：验证回环端点、发现、角色与只读边界、packet/进程隔离、两层权限与费用。 | 回环/非法端点严格分类且不触发 DNS；远程/冲突/未知 transport 端点失败关闭且推理 `Popen`=0；无计划发现的 family 为 `None`；写角色与 `read_only=false` 在配置发现前拒绝；cwd/`--dir` 为临时只读目录；两层 `*` 及 read/glob/grep/edit/write/bash/shell/external_directory/webfetch/websearch/task/subagent/skill/question 均 deny、steps=2、仅 ollama；本地费用为确认零。 | PLAT-06, MODEL-14, MODEL-13, AUTH-04/05/07/09, COST-06, QA-03/08/09/12, STATE-05 |
+| MVP-A32 | 本地 Ollama 经 OpenCode 承担 `review`/`rereview`：验证回环端点、发现、角色与只读边界、packet/进程隔离、两层权限与费用。 | 回环/非法端点严格分类且不触发 DNS；远程/冲突/未知 transport 端点失败关闭且推理 `Popen`=0；无计划发现的 family 为 `None`；写角色与 `read_only=false` 在配置发现前拒绝；cwd/`--dir` 为临时只读目录；两层 `*` 及 read/glob/grep/edit/write/bash/shell/external_directory/webfetch/websearch/task/subagent/skill/question 均 deny、steps 等于任务授权预算、仅 ollama；本地费用为确认零。 | PLAT-06, MODEL-14, MODEL-13, AUTH-04/05/07/09, COST-06, QA-03/08/09/12, STATE-05 |
 | MVP-A33 | 本地 Ollama 调用的失败、协议错误、UNKNOWN、恢复、独立性与授权边界。 | 正数非零退出/无可用结果为协议错误并保留 usage 与 `termination_reason`，不 fallback；超时/signal/KeyboardInterrupt 为 `UNKNOWN` 且保留已确认证据、resume 不重发；明确步骤耗尽为已知失败且不生成 review row；写角色 fallback 到 Ollama 时 LocalOllamaReviewerAdapter 从未被调用且暂停原因可追溯；provider/model_id/version/family/is_local 变化改变 plan_hash 并使旧授权失效。 | QA-08/09/12, STATE-03/05, AUTH-04/05/07/09 |
+
+资源预算修复新增验收（本轮替身证据已完成，独立验收待完成）：
+
+| 编号 | 场景 | 通过条件 | 对应需求 |
+| --- | --- | --- | --- |
+| MVP-A34 | 审核步骤设置 2/8/12，替身需三轮或一轮完成。 | LM Studio/Ollama/remote review 与 rereview 按授权配置；单轮提前返回；耗尽不生成 review、不重发，保留 Token/费用。 | TASK-09, AUTH-10, STATE-06 |
+| MVP-A35 | 角色授权、模型 output/context、fallback、配置覆盖与未知能力组合。 | 16000/65536/384000 fixture 的有效值正确，能力/别名/来源冻结并绑定授权；未知能力不能签发授权，配置篡改推理前拒绝；最终参数有源码路径和替身证据。 | MODEL-15, TASK-10/11, AUTH-10 |
+| MVP-A36 | 同任务 steps=12、review output=16000；旧计划、暂停、UNKNOWN 与复审。 | 两预算独立生效；任何预算变化使旧授权失效；旧库读取不改历史；正常/失败/UNKNOWN/复用保留最小预算审计；恢复不重复调用。 | AUTH-10, STATE-03/06, QA-08/10/11 |
+
+| 编号 | 场景 | 通过条件 | 对应需求 |
+| --- | --- | --- | --- |
+| MVP-A37 | `length` 无文本/部分文本/合法审核 JSON，以及 stop 无文本、非零退出。 | 已知失败保留使用量、费用可用性及会话；不生成 review、不自动重试或续接，resume 不重发；明确零值与未知值区分。 | QA-08, QA-13, STATE-06 |
+| MVP-A38 | LM Studio 审核环境含旧文件，或全局/Agent 配置被覆盖为允许读取。 | review/rereview 两层全工具禁用；权限覆盖和非只读请求在推理前拒绝；implementation/revision 既有权限保持；配置诊断不输出配置值。 | QA-14, TASK-11, PRIV-06 |
 
 ## 5. MVP 完成定义
 
 同时满足以下条件才算 MVP 通过：
 
-1. MVP-A01 至 MVP-A33 全部通过，且每项有非模型自述的可核查证据。
+1. MVP-A01 至 MVP-A38 全部通过，且每项有非模型自述的可核查证据；A34–A38 的实施者确定性结果不等于独立批准。
 2. 没有未解决的 P0/P1 审核问题。
 3. 通用核心没有硬编码候选模型或金融规则。
 4. 未包含“明确不做”列表中的能力作为隐含依赖。

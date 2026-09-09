@@ -53,6 +53,7 @@ from agentflow.workspace import GitWorkspace
 
 
 PROVIDER = "review-provider"
+from resource_budget_fixtures import budgeted_request, resolved_output_stub, budgeted_plan_contract
 MODEL_ID = "review-model"
 
 
@@ -89,7 +90,7 @@ def remote_task(
 
 def remote_plan(task: TaskContract | None = None) -> PlanContract:
     actual = task or remote_task()
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="remote-plan",
         schema_version=1,
         version=1,
@@ -104,7 +105,7 @@ def remote_plan(task: TaskContract | None = None) -> PlanContract:
 
 
 def review_request(*, role: str = "review", read_only: bool = True) -> InvocationRequest:
-    return InvocationRequest(
+    return budgeted_request(
         call_id="call-1",
         request_key="request-1",
         run_id="run-1",
@@ -128,6 +129,7 @@ class _CompletedProcess:
         return self.stdout, ""
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class RemoteAdapterTests(unittest.TestCase):
     def test_command_is_an_argument_array_and_remote_permissions_deny_all_tools(self) -> None:
         events = "\n".join(
@@ -597,6 +599,7 @@ class CostAuditTests(unittest.TestCase):
         self.assertEqual(1, entries["count"])
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class ReviewPacketTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -1223,6 +1226,7 @@ class ReviewPacketTests(unittest.TestCase):
         self.assertEqual(1, len(local.invocations))
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class RemoteCliStubTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

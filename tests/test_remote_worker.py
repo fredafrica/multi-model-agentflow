@@ -46,6 +46,7 @@ from agentflow.states import RunState, TaskState
 from agentflow.workspace import GitWorkspace, InputArtifactError, StagingSyncError
 
 WORKER_PROVIDER = "worker-provider"
+from resource_budget_fixtures import budgeted_request, resolved_output_stub, budgeted_plan_contract
 WORKER_MODEL = "worker-model"
 
 
@@ -95,7 +96,7 @@ def worker_plan(
     allowed_provider_ids: tuple[str, ...] = ("fake", WORKER_PROVIDER),
 ) -> PlanContract:
     actual = task or worker_task()
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="worker-plan",
         schema_version=1,
         version=1,
@@ -111,7 +112,7 @@ def worker_plan(
 
 
 def worker_request(*, role: str = "implementation", read_only: bool = False) -> InvocationRequest:
-    return InvocationRequest(
+    return budgeted_request(
         call_id="call-1",
         request_key="request-1",
         run_id="run-1",
@@ -304,6 +305,7 @@ class RemoteWorkerPolicyTests(unittest.TestCase):
         self.assertTrue(any("network denied" in item for item in denied.reasons))
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class RemoteWorkerAdapterTests(unittest.TestCase):
     def _adapter(self, tempdir: Path) -> RemoteOpenCodeWorkerAdapter:
         return RemoteOpenCodeWorkerAdapter(
@@ -342,7 +344,7 @@ class RemoteWorkerAdapterTests(unittest.TestCase):
             adapter = self._adapter(worktree)
             request = replace(
                 worker_request(),
-                metadata={"worktree": str(worktree), "allowed_files": ("out.txt",)},
+                metadata={**worker_request().metadata, "worktree": str(worktree), "allowed_files": ("out.txt",)},
             )
             with mock.patch("subprocess.run", return_value=discovery), mock.patch(
                 "subprocess.Popen", side_effect=popen
@@ -396,7 +398,7 @@ class RemoteWorkerAdapterTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             adapter = self._adapter(Path(directory))
-            request = replace(worker_request(), metadata={"worktree": directory})
+            request = replace(worker_request(), metadata={**worker_request().metadata, "worktree": directory})
             with mock.patch("subprocess.run", return_value=discovery), mock.patch(
                 "subprocess.Popen",
                 return_value=_CompletedProcess(fixture.read_text(encoding="utf-8")),
@@ -425,7 +427,7 @@ class RemoteWorkerAdapterTests(unittest.TestCase):
         process = TimedOutProcess()
         with tempfile.TemporaryDirectory() as directory:
             adapter = self._adapter(Path(directory))
-            request = replace(worker_request(), metadata={"worktree": directory})
+            request = replace(worker_request(), metadata={**worker_request().metadata, "worktree": directory})
             with mock.patch("subprocess.run", return_value=discovery), mock.patch(
                 "subprocess.Popen", return_value=process
             ), mock.patch(

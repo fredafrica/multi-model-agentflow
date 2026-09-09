@@ -2,17 +2,34 @@
 
 ## Goal
 
-修复现有本地 Ollama packet-only Reviewer 实现，补齐行为测试与文档，在不回归既有路径的前提下交付给 Codex 复核。
+按 2026-09-08 资源预算交接计划修复 BUG-RB-01/02；复用现有 worktree，保留分项确定性证据，独立验收另行进行。
 
 ## Current Phase
+
+里程碑 21 补充审核隔离：真实 Qwen 上轮返回两条 P3，zero_findings 未通过，且读取了旧工作树。本轮按 Owner 批准方案禁用 LM Studio 审核工具、复核最终权限并改善诊断；新增 6 项定向测试通过，全量 480 项通过（34.898 秒），本机 OpenCode 无推理配置复核通过。真实复验待新哈希批准；历史结果不覆盖。证据见 `docs/verification/2026-09-08-lmstudio-review-isolation-fix.md`。
+
+里程碑 21 补充 A＋B：输出额度耗尽/无文本失败审计已修复，新增 9 项测试，474 项全量回归通过。分类器升级为 3，历史 DB/UNKNOWN/预算不变。真实审核的 C 方案未执行；独立验收仍待完成。证据见 `docs/verification/2026-09-08-output-termination-fix.md`。
+
+里程碑 21：实现与确定性检查完成，独立验收待完成。A 基线 442 项通过；B/C 两项预算已贯通；D 联合预算、fallback、旧授权与恢复通过；全量 465 项通过；E 规范、canonical Skill 与分项证据已同步。报告：`docs/verification/2026-09-08-reviewer-resource-budgets.md`。以下为历史验收记录。
 
 里程碑 20 已由 Codex 于 2026-09-08 正式独立批准（REVIEW_PASSED）。R01–R05 及 R04 混合使用量残余已关闭；最终 442 项全量测试和 14 项独立检查通过，离线构建与隔离安装通过。未执行额外真实模型 smoke，未提交、推送或更新全局安装。最终证据见 `docs/verification/2026-09-08-ollama-reviewer-codex-approval.md`。
 
 ## Next Step
 
-本次实现与验收已关闭，保留未提交 diff 交付。后续提交、整合、安装或真实模型验证须由用户另行安排，不自动启动。
+等待 Owner 安排不同模型自测与独立审核。真实 smoke、新计划授权、提交/合并和全局安装更新均需后续明确安排；本轮不自动执行。
 
 ## Milestones
+
+### 里程碑 21：Reviewer 步骤与模型输出预算
+
+**Status:** implementation and deterministic checks complete — 独立验收待完成
+
+- [x] A：核对分支/HEAD/改动，完整读取规范，442 项无费用基线通过。
+- [x] B：BUG-RB-01 配置驱动失败复现、合同/Runner/所有审核路径与恢复证据。
+- [x] C：BUG-RB-02 能力快照、角色授权、有效输出、配置与调用审计。
+- [x] D：联合预算、授权失效与恢复回归；465 项全量确定性测试通过。
+- [x] E：四份规范与 canonical Skill 同步、验证报告交付。
+- [ ] 不同模型自测与独立审核；当前实施证据不构成批准。
 
 ### 里程碑 1：实现设计冻结
 

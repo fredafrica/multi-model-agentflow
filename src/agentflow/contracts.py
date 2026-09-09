@@ -113,6 +113,11 @@ class SupervisorReasoningEffort(StringEnum):
 
 DEFAULT_IMPLEMENTATION_MAX_STEPS = 8
 IMPLEMENTATION_MAX_STEPS_LIMIT = 32
+DEFAULT_REVIEW_MAX_STEPS = 8
+REVIEW_MAX_STEPS_LIMIT = 32
+# Defensive signed 32-bit resource boundary, not a model capability claim.
+TOKEN_LIMIT = 2_147_483_647
+DEFAULT_ROLE_MAX_OUTPUT_TOKENS = 16000
 
 DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS = 900
 IMPLEMENTATION_TIMEOUT_SECONDS_MIN = 60
@@ -297,6 +302,54 @@ class ModelRecord:
     average_rework_count: float | None = None
     independently_reviewed_tasks: int = 0
     availability_state: ModelAvailabilityState = ModelAvailabilityState.UNAVAILABLE
+    max_output_tokens: int | None = None
+    capability_source: str | None = None
+    capability_source_version: str | None = None
+    api_model_id: str | None = None
+
+    def __post_init__(self) -> None:
+        for name in ("context_length", "max_output_tokens"):
+            value = getattr(self, name)
+            if value is not None:
+                _coerce_range(value, 1, TOKEN_LIMIT, name)
+        _validate_capability_source(self.capability_source, self.capability_source_version)
+        if self.api_model_id is not None:
+            if not isinstance(self.api_model_id, str):
+                raise ValueError("api_model_id must be a model identifier")
+            validate_model_id(self.api_model_id)
+
+
+def _validate_capability_source(source: str | None, version: str | None) -> None:
+    if source is None and version is None:
+        return
+    if source not in ("registry_config", "opencode_catalog", "conservative_fallback"):
+        raise ValueError("invalid capability source")
+    if not isinstance(version, str) or not version.strip() or len(version) > 256:
+        raise ValueError("capability source version is required and must be bounded")
+
+
+@dataclass(frozen=True)
+class ModelCapabilitySnapshot:
+    ref: ModelRef
+    context_length: int | None
+    max_output_tokens: int
+    source: str
+    source_version: str
+    api_model_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.ref, ModelRef):
+            raise ValueError("capability must identify an exact model")
+        if self.context_length is not None:
+            _coerce_range(self.context_length, 1, TOKEN_LIMIT, "context_length")
+        _coerce_range(self.max_output_tokens, 1, TOKEN_LIMIT, "max_output_tokens")
+        _validate_capability_source(self.source, self.source_version)
+        if self.source is None:
+            raise ValueError("capability source is required")
+        if self.api_model_id is not None:
+            if not isinstance(self.api_model_id, str):
+                raise ValueError("api_model_id must be a model identifier")
+            validate_model_id(self.api_model_id)
 
 
 @dataclass(frozen=True)
@@ -403,8 +456,14 @@ class TaskContract:
     remote_worker_timeout_seconds: int = DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS
     input_artifacts: tuple[InputArtifact, ...] = ()
     review_acceptance_policy: ReviewAcceptancePolicy = ReviewAcceptancePolicy.BLOCK_P0_P1
+    review_max_steps: int = DEFAULT_REVIEW_MAX_STEPS
+    implementation_max_output_tokens: int = DEFAULT_ROLE_MAX_OUTPUT_TOKENS
+    review_max_output_tokens: int = DEFAULT_ROLE_MAX_OUTPUT_TOKENS
 
     def __post_init__(self) -> None:
+        _coerce_range(self.review_max_steps, 2, REVIEW_MAX_STEPS_LIMIT, "review_max_steps")
+        for name in ("implementation_max_output_tokens", "review_max_output_tokens"):
+            _coerce_range(getattr(self, name), 1, TOKEN_LIMIT, name)
         object.__setattr__(
             self, "max_remote_cost", _coerce_money(self.max_remote_cost, "max_remote_cost")
         )
@@ -503,6 +562,7 @@ class PlanContract:
     allowed_provider_ids: tuple[str, ...] = ()
     authorization_ttl_seconds: int = 86_400
     supervisor_policy: SupervisorPolicy = field(default_factory=SupervisorPolicy)
+    model_capabilities: tuple[ModelCapabilitySnapshot, ...] = ()
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "schema_version", int(self.schema_version))
@@ -572,6 +632,18 @@ class PlanContract:
         unknown_wake_events = set(self.supervisor_policy.wake_events) - SUPERVISOR_WAKE_EVENTS
         if unknown_wake_events:
             raise ValueError(f"unknown supervisor wake events: {unknown_wake_events}")
+        if not isinstance(self.model_capabilities, (tuple, list)) or any(
+            not isinstance(item, ModelCapabilitySnapshot) for item in self.model_capabilities
+        ):
+            raise ValueError("model_capabilities must contain capability snapshots")
+        object.__setattr__(self, "model_capabilities", tuple(self.model_capabilities))
+        keys = [item.ref.registry_key for item in self.model_capabilities]
+        if len(keys) != len(set(keys)) or not set(keys) <= listed_models:
+            raise ValueError("capability snapshots must be unique planned models")
+        refs = {model for task in self.tasks for model in
+                (task.implementation_model, task.review_model, task.fallback_model) if model}
+        if any(item.ref not in refs for item in self.model_capabilities):
+            raise ValueError("capability snapshot model identity differs from plan")
 
     @property
     def provider_ids(self) -> tuple[str, ...]:

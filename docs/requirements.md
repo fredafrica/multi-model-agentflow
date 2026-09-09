@@ -51,6 +51,7 @@
 | MODEL-12 | 信任统计必须按供应商、精确模型版本和任务类型隔离；至少有 20 个经独立审核的任务后，系统才可以提示提升信任，且不得自动提升。 | 小于 20 个合格样本时无升级建议；满足样本量后仍需用户确认。 |
 | MODEL-13 | 模型发现必须区分 `unsupported`、`not_configured`、`discoverable`、`unavailable`、`callable_unverified` 与 `callable_verified`；OpenCode 无推理列表只能证明配置/可发现，不能证明真实可调用。 | 发现流程不发送推理请求；只有另行计划、哈希批准的 smoke test 才能写入 `callable_verified`。 |
 | MODEL-14 | 本地 Ollama Reviewer 在每次调用前必须重新验证实际 OpenCode 有效配置（`provider.ollama` 的 npm、`options.baseURL` 与所选模型条目），端点必须是确定性回环；错误配置、远程端点、无法证明的端点或配置冲突必须失败关闭，不得用构造时快照或环境变量替代实际调用地址。未提供计划元数据的发现不得猜测模型 family（保持 `None`）。 | 远程/冲突/非法端点与未知 transport 都以受控异常拒绝且推理 `Popen` 次数为 0；无计划发现时 `family` 为 `None`。 |
+| MODEL-15 | 模型输出能力 `max_output_tokens` 必须独立于 `context_length`，并记录可信来源与来源版本；批准前必须把所有主模型和 fallback 的精确能力快照固化进计划。来源或能力未知时不得授权执行，不得从 context、模型自述或模型列表推测 output。 | 注册表记录与快照往返保留来源；缺快照拒绝授权；配置能力减小或来源失效在推理前拒绝，增大不能扩大已授权有效输出。 |
 
 ## 5. 激活、运行模式与授权
 
@@ -65,6 +66,7 @@
 | AUTH-07 | 计划必须使用带 schema 版本、稳定键排序且排除易变运行字段的规范化 JSON，并以 SHA-256 生成授权哈希。增量授权必须生成新的完整授权快照；授权在计划变化、运行结束或 24 小时后失效，以最先发生者为准。 | 相同有效计划得到相同哈希；任一授权范围变化都产生新哈希且旧授权不可继续使用。 |
 | AUTH-08 | MVP 中托管、监督和自适应三种模式都必须形成端到端闭环；自适应模式只能按明确风险阈值与关键节点标记设置确认点，不得使用学习型路由或隐式改变策略。 | 三种模式均可完成同一计划，且自适应模式的每个确认/放行决定可以由静态规则复现。 |
 | AUTH-09 | 计划与授权快照必须同时绑定 provider、精确模型键、角色、文件、禁止动作、预算、远程数据权限、隐私策略、运行模式和有效期；任一范围变化必须重新执行 plan show、哈希批准、authorize、start 顺序。 | provider 或远程 Reviewer 权限变化后旧授权不能启动调用；OpenCode 已配置模型不能替代计划授权。 |
+| AUTH-10 | 审核步骤预算、角色输出授权和精确模型能力快照（包括存在别名时的 API model ID）必须进入 canonical JSON 与计划哈希。旧计划补充字段后不能沿用旧批准，也不能自动改写业务数据库或刷新授权。 | 修改任一预算/能力/来源/别名使旧授权无效；旧暂停计划可读取，恢复前拒绝旧哈希且调用历史保持原样。 |
 
 ## 6. 风险与安全
 
@@ -119,6 +121,9 @@ max_retry_count:
 escalation_conditions:
 expected_outputs:
 implementation_max_steps:
+review_max_steps:
+implementation_max_output_tokens:
+review_max_output_tokens:
 implementation_timeout_seconds:
 implementation_max_continuations:
 allow_remote_implementation:
@@ -143,6 +148,14 @@ review_acceptance_policy:
 | TASK-07 | 任务可携带显式输入快照 `input_artifacts`，为 `(path, sha256)` 元组列表，声明远程实施执行前必须存在且内容哈希匹配的只读输入文件。path 必须项目相对且不得与 `allowed_files` 重叠，sha256 必须是 64 位十六进制，路径不得重复；越界、绝对路径、非十六进制哈希、重复路径或与可写文件重叠在构造/解析时被拒绝。该字段进入规范化 JSON 与计划哈希。执行前将输入按哈希校验后原子复制到最小沙箱并记录 `input_artifact.snapshotted` 事件，执行后再次核验未被改动。 | 远程实施任务可声明输入快照；`plan show` 展示该字段；错误路径或哈希被拒绝；改变快照后旧授权不能授权修改后的计划。 |
 | TASK-08 | 远程 implementation/revision 任务必须由任务合同显式允许（`allow_remote_implementation=true`），且仅当 `remote_worker_network_mode` 可安全执行时放行；远程 Worker 在授权 worktree 内写，但 `bash`/`shell`/`external_directory`/`webfetch`/`websearch`/`task`/`subagent`/`skill`/`question` 全部禁用。远程 Worker 使用 `remote_worker_max_steps`（缺省 32，1–128）与 `remote_worker_timeout_seconds`（缺省 900，60–14400），进入计划哈希与授权；步骤耗尽安全暂停且不续接，超时或结果不可确认保持 `UNKNOWN`。 | 参数数组使用 `<provider>/<model-id>` 且权限配置禁用全部网络与子代理；未授权远程实施或 `ALLOWLIST` 网络模式在进程启动前被确定性拒绝；步骤耗尽暂停且 resume 不重复调用；越界预算/超时/哈希被拒绝。 |
 
+资源预算补充要求（BUG-RB-01/02）：
+
+| 编号 | 要求 | 可验收结果 |
+| --- | --- | --- |
+| TASK-09 | review/rereview 必须使用独立的任务级 `review_max_steps`，默认 8，范围 2–32，严格拒绝 bool、浮点、字符串、null 和越界值。此值是 Agent 循环上限，不是最低轮数，不改变单次上下文或工具权限。 | 本地 LM Studio/Ollama、远程 Reviewer 均把 2/8/12 等授权值送至实际进程配置；单轮可提前完成；步骤耗尽暂停、保留使用量且恢复不重发。 |
+| TASK-10 | implementation/revision 共用 `implementation_max_output_tokens`，review/rereview 共用 `review_max_output_tokens`，默认均为 16000。有效输出等于冻结能力和对应角色授权的较小值；fallback 与续接使用实际模型的冻结快照。Token 字段必须严格为正整数，资源防御上界为 2^31−1，不能冒充任何模型的能力上限。 | 65536 能力配 16000/100000 授权分别得到 16000/65536；384000 fixture 不被通用 65536 常量截断；预算与费用预留独立。 |
+| TASK-11 | 适配器必须把有效输出绑定到最终生成参数所用的调用级配置，并复核实际解析后的模型、限制、权限与端点。配置不可靠、未知 transport、未验证输出/思考覆盖或别名变化必须推理前拒绝；不得修改用户全局配置。 | OpenCode 的模型 output 与子进程运行时上限一致；Ollama 环境重建后限制不丢失；配置篡改时推理进程为 0。 |
+
 ## 10. 质量门禁
 
 | 编号 | 要求 | 可验收结果 |
@@ -159,6 +172,11 @@ review_acceptance_policy:
 | QA-11 | 本地实施/修订角色调用因步骤上限耗尽而已知失败时，仅当全部条件满足（本地模型、实施/修订角色、同一模型与 worktree/文件范围、`implementation_max_continuations` 限额内、文件范围核验通过、无暂停/取消/接管、非 `UNKNOWN`/超时/signal/费用未知）才可在同一 OpenCode 会话内以新 segment 续接；每个 segment 拥有唯一 call_id、request_key、segment_index 与 continuation_of_call_id，并单独记录 Token、耗时与费用；续接决定必须持久化为 `continuation.scheduled` 事件，segment 间进程重启后 resume 必须只续接一次且不重复已完成 segment。任一条件不满足时必须保持安全暂停且不得续接或重试。 | 步骤耗尽后实施在限额内以 `--session` 复用同一 OpenCode 会话继续并最终完成；远程 Reviewer、`UNKNOWN`、超时、signal、越界文件、缺失会话 ID 或超过限额的场景保持暂停且 resume 不产生重复调用；续接 segment 的调用记录与 `continuation.scheduled` 事件可审计。 |
 | QA-09 | Reviewer 提示必须在 Review Packet 之外强制 JSON-only 协议：只允许一个顶层对象，`approved` 必须是 boolean，`findings` 必须是数组，每项必须有 P0-P3 `severity`、字符串 `title` 和 `explanation`，可选字符串 `path`/`remediation`。Markdown fence、前后散文、缺字段、错类型或非法严重度均不得猜测性解析；任一 P0/P1 必须覆盖 `approved=true`。 | 有效纯 JSON 产生正式 review 记录；所有非合规样例安全暂停且不得批准。 |
 | QA-12 | 任务可携带 `review_acceptance_policy` 审核接受策略：`block_p0_p1`（缺省）只让 P0/P1 阻断批准；`zero_findings` 要求零 findings（含 P2/P3）才批准。策略在解析审核结果时确定性应用，不能由审核输出覆盖。 | 相同审核输出在不同策略下产生符合定义的批准/拒绝；P2/P3 finding 在 `zero_findings` 下阻断批准，在 `block_p0_p1` 下不阻断。 |
+
+| 编号 | 要求 | 可验收结果 |
+| --- | --- | --- |
+| QA-13 | 最终结构化终止原因 `length` 必须视为输出额度耗尽，即使文本是合法批准 JSON 也不得成功；无文本及已知非零退出必须保留已报告的使用量、会话与失败证据。输出额度耗尽和协议失败不得自动重试、fallback、续接或由 resume 重发。 | 合成 reasoning-only、部分文本、合法 JSON 均验证失败分类；缺失 Token 与明确零值可区分；失败落库后恢复不新增调用。 |
+| QA-14 | LM Studio 的 review/rereview 必须只审核提供的材料，强制 read_only=true，并在全局与审核 Agent 两层禁用全部工具；实际解析后的权限若被覆盖为允许或含糊规则，必须在推理前拒绝。实施/修订权限不变。 | 禁止读取旧工作树、搜索、写入和外部工具；权限覆盖与非只读审核请求均在推理前拒绝；真实配置检查和替身回归保留证据。 |
 
 ## 11. Git 隔离与并发
 
@@ -193,6 +211,7 @@ review_acceptance_policy:
 | STATE-03 | 恢复时必须先检查原任务是否仍运行，不得重复已完成任务或已完成收费调用，并从最近检查点继续且继续遵守原授权和预算。 | 进程重启测试无重复副作用或重复收费调用。 |
 | STATE-04 | 追加事件与当前状态投影必须保存在同一个 SQLite 数据库，并在同一事务中提交；独立 JSONL 只能由已提交事件再生成，不得成为第二权威写入源。 | 在事件追加和状态更新之间模拟故障时，两者全部提交或全部回滚。 |
 | STATE-05 | 每次模型调用必须可追溯到 run、task、attempt、call 与幂等 request key，并记录角色、provider、模型 ID/版本/family、本地/远程、provider 请求或会话 ID、Token、费用可用性、起止时间、耗时、终态和测试替身标志。 | 任一调用可通过数据库关联还原全部字段；`UNKNOWN` 在人工 resolve-call 前不能被 resume 或重复派发。 |
+| STATE-06 | 正常、已知失败、UNKNOWN、复用与恢复调用必须保留角色、实际模型、授权输出、能力快照哈希/来源、有效输出和 configured steps；只保存最小预算证据，不保存完整 resolved 配置、认证对象或 headers。 | `request_scope_json.resource_budgets` 与计划可逐项对应；已有 Token、费用和 UNKNOWN 不因预算迁移改变。 |
 | HUMAN-01 | 人工介入必须支持只观察、安全暂停和立即冻结。 | 三种操作有不同且可观察的行为。 |
 | HUMAN-02 | 安全暂停必须停止新派发、冻结未启动任务、让当前最小工作单元收尾、保存差异/测试/日志/费用/审核状态、释放写锁并生成人工接管摘要。 | 到达暂停状态后逐项证据完整。 |
 | HUMAN-03 | 暂停生命周期至少要表达 `RUNNING`、`PAUSE_REQUESTED`、`QUIESCING`、`PAUSED`、`USER_TAKEOVER` 和 `RESUMING`。 | 状态迁移可查询且非法迁移被拒绝。 |

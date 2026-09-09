@@ -26,6 +26,7 @@ from agentflow.contracts import (
 from agentflow.database import Database
 from agentflow.policies import invocation_decision
 from agentflow.states import InvocationState, TaskState
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def _remote_task(task_id: str = "task-1") -> TaskContract:
@@ -51,7 +52,7 @@ def _remote_task(task_id: str = "task-1") -> TaskContract:
 
 
 def _remote_plan(task: TaskContract | None = None) -> PlanContract:
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="budget-plan",
         schema_version=1,
         version=1,

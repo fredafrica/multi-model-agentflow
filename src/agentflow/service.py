@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import json
 
 from .adapters import (
     AdapterRouter,
     InvocationIncompleteError,
+    InvocationProtocolError,
     InvocationOutcomeUnknown,
     ModelAdapter,
     ReviewerProtocolError,
@@ -23,6 +25,8 @@ from .contracts import (
 from .database import Database
 from .policies import classify_policy_denial, invocation_decision
 from .states import InvocationState
+from .resource_budgets import invocation_budgets
+from .serialization import canonical_json
 
 
 class PolicyDeniedError(RuntimeError):
@@ -70,6 +74,19 @@ class InvocationService:
         reuse_planned: bool = False,
     ) -> InvocationResult:
         validate_authorization(context.authorization, context.plan)
+        if context.task not in context.plan.tasks:
+            raise PolicyDeniedError("task contract differs from authorized plan")
+        budgets = invocation_budgets(context.plan, context.task, request.model, request.role)
+        supplied = request.metadata.get("resource_budgets")
+        if supplied is not None and canonical_json(supplied) != canonical_json(budgets):
+            raise PolicyDeniedError("request resource budgets differ from authorized plan")
+        if "review_max_steps" in request.metadata and (
+            type(request.metadata["review_max_steps"]) is not int
+            or request.metadata["review_max_steps"] != context.task.review_max_steps
+        ):
+            raise PolicyDeniedError("request review steps differ from authorized plan")
+        request = replace(request, metadata={**request.metadata, "resource_budgets": budgets,
+                                            "review_max_steps": context.task.review_max_steps})
         decision = invocation_decision(
             request,
             task=context.task,
@@ -188,7 +205,7 @@ class InvocationService:
                     call_id, error.provider_request_id, result
                 )
             raise
-        except (ReviewerProtocolError, WorkerProtocolError) as error:
+        except (InvocationProtocolError, ReviewerProtocolError, WorkerProtocolError) as error:
             result = error.result
             if result is not None:
                 if request.model.is_local:
@@ -224,7 +241,8 @@ class InvocationService:
                 if row["remote_cost"] is not None
                 else None
             ),
-            raw_metadata={"reused": True},
+            raw_metadata={**json.loads(row["raw_metadata_json"] or "{}"), "reused": True,
+                          "resource_budgets": json.loads(row["request_scope_json"]).get("resource_budgets")},
             cost_unavailable=bool(row["cost_unavailable"]),
         )
 

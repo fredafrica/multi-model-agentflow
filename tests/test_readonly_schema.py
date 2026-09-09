@@ -20,6 +20,7 @@ from agentflow.contracts import (
 )
 from agentflow.database import Database
 from agentflow.schema import DDL, SCHEMA_VERSION
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def _plan() -> PlanContract:
@@ -41,7 +42,7 @@ def _plan() -> PlanContract:
         escalation_conditions=(),
         expected_outputs=("a.txt",),
     )
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="p",
         schema_version=1,
         version=1,

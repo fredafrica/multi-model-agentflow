@@ -44,6 +44,14 @@ class ReviewerUnavailableError(RuntimeError):
     """A planned reviewer cannot be selected without sending a model request."""
 
 
+class InvocationProtocolError(RuntimeError):
+    """A completed process returned no usable result; keep its usage evidence."""
+
+    def __init__(self, message: str, *, result: InvocationResult) -> None:
+        super().__init__(message)
+        self.result = result
+
+
 class UnsupportedProviderError(ReviewerUnavailableError):
     pass
 

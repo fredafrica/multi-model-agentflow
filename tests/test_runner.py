@@ -34,6 +34,7 @@ from agentflow.opencode_adapter import OpenCodeAdapter
 from agentflow.runner import Runner
 from agentflow.states import ControlState, InvocationState, RunState, TaskState
 from agentflow.workspace import GitWorkspace, GitWorkspaceError
+from resource_budget_fixtures import budgeted_plan_contract, resolved_output_stub
 
 
 def git(root: Path, *args: str) -> None:
@@ -73,7 +74,7 @@ def make_task(
 
 def make_plan(mode: RunMode = RunMode.MANAGED, tasks: tuple[TaskContract, ...] | None = None):
     actual_tasks = tasks or tuple(make_task(f"task-{number}") for number in range(1, 4))
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="runner-plan",
         schema_version=1,
         version=1,
@@ -119,6 +120,7 @@ def step_limit_result() -> InvocationResult:
     )
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class RunnerTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -892,6 +894,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn("scope_violation", reasons)
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class ContinuationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()

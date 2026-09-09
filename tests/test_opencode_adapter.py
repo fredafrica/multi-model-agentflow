@@ -8,9 +8,10 @@ import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
+from resource_budget_fixtures import budgeted_request, resolved_output_stub
 
-from agentflow.adapters import InvocationIncompleteError, InvocationOutcomeUnknown
-from agentflow.contracts import DataSensitivity, InvocationRequest, ModelRef
+from agentflow.adapters import InvocationIncompleteError, InvocationOutcomeUnknown, InvocationRequest
+from agentflow.contracts import DataSensitivity, ModelRef
 from agentflow.opencode_adapter import (
     OpenCodeAdapter,
     _merge_overlapping_output_bytes,
@@ -75,7 +76,7 @@ class _KillFailingProcess:
 
 
 def _local_request(worktree: Path) -> InvocationRequest:
-    return InvocationRequest(
+    return budgeted_request(
         call_id="call-1",
         request_key="request-1",
         run_id="run-1",
@@ -89,6 +90,7 @@ def _local_request(worktree: Path) -> InvocationRequest:
     )
 
 
+@mock.patch('agentflow.opencode_adapter._read_output_config', new=resolved_output_stub)
 class OpenCodeAdapterTests(unittest.TestCase):
     def test_discovery_only_returns_loaded_llms(self) -> None:
         payload = [
@@ -596,7 +598,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
             32, raised.exception.result.raw_metadata["configured_step_limit"]
         )
         self.assertEqual(
-            "2", raised.exception.result.raw_metadata["classifier_version"]
+            "3", raised.exception.result.raw_metadata["classifier_version"]
         )
 
     def test_summary_step_limit_marker_wrapped_in_markdown_is_not_termination(self) -> None:
@@ -916,7 +918,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
             {"type": "text", "sessionID": "s", "part": {"type": "text", "text": "done"}}
         )
         with tempfile.TemporaryDirectory() as directory:
-            request = InvocationRequest(
+            request = budgeted_request(
                 call_id="call-1",
                 request_key="request-1",
                 run_id="run-1",
@@ -1039,7 +1041,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             for value in (0, -1, 33, True, 8.5, "16"):
                 with self.subTest(value=value):
-                    request = InvocationRequest(
+                    request = budgeted_request(
                         call_id="call-1",
                         request_key="request-1",
                         run_id="run-1",
@@ -1064,7 +1066,7 @@ class OpenCodeAdapterTests(unittest.TestCase):
     def _timeout_request(
         self, directory: str, metadata: dict[str, object]
     ) -> InvocationRequest:
-        return InvocationRequest(
+        return budgeted_request(
             call_id="call-1",
             request_key="request-1",
             run_id="run-1",

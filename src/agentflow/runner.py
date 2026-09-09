@@ -12,6 +12,7 @@ from uuid import uuid4
 from .adapters import (
     AdapterRouter,
     InvocationIncompleteError,
+    InvocationProtocolError,
     InvocationOutcomeUnknown,
     ModelAdapter,
     ReviewerProtocolError,
@@ -151,6 +152,8 @@ class Runner:
             raise ValueError(
                 "run has an UNKNOWN model call that must be reconciled before resume"
             )
+        if self.database.nonretryable_output_failures(run_id):
+            raise ValueError("run has an output-limit or protocol failure; automatic redispatch is forbidden")
         if self.database.unresolved_suspected_step_limit_calls(run_id):
             raise ValueError(
                 "run has a suspected step-limit model call that requires manual "
@@ -223,7 +226,11 @@ class Runner:
                 return RunResult(run_id, RunState.PAUSED)
             except InvocationIncompleteError as error:
                 state = self.database.task_state(run_id, task.task_id)
-                if error.failure_kind == "session_mismatch":
+                if error.failure_kind == "output_limit_reached":
+                    reason = ("review_output_limit_reached" if state in
+                              (TaskState.WAITING_REVIEW, TaskState.WAITING_REREVIEW)
+                              else "implementation_output_limit_reached")
+                elif error.failure_kind == "session_mismatch":
                     reason = "session_mismatch"
                 elif error.failure_kind == "suspected_step_limit":
                     reason = "suspected_step_limit"
@@ -232,6 +239,9 @@ class Runner:
                 else:
                     reason = "implementation_step_limit_reached"
                 self._complete_safe_pause(run_id, task.task_id, reason)
+                return RunResult(run_id, RunState.PAUSED)
+            except InvocationProtocolError:
+                self._complete_safe_pause(run_id, task.task_id, "model_output_invalid")
                 return RunResult(run_id, RunState.PAUSED)
             except ReviewerProtocolError:
                 self._complete_safe_pause(
@@ -653,6 +663,7 @@ class Runner:
                     "worktree": str(invoke_worktree),
                     "allowed_files": task.allowed_files,
                     "implementation_max_steps": task.implementation_max_steps,
+                    "review_max_steps": task.review_max_steps,
                     "implementation_timeout_seconds": task.implementation_timeout_seconds,
                     "remote_worker_max_steps": task.remote_worker_max_steps,
                     "remote_worker_timeout_seconds": task.remote_worker_timeout_seconds,

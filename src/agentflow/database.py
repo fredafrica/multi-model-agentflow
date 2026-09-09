@@ -1835,6 +1835,7 @@ class Database:
                 canonical_json(
                     {
                         "allowed_files": request.metadata.get("allowed_files", ()),
+                        "resource_budgets": request.metadata.get("resource_budgets"),
                         "test_double": bool(request.metadata.get("test_double", False)),
                         "packet_hash": request.metadata.get("packet_hash"),
                         "packet_size": request.metadata.get("packet_size"),
@@ -2365,6 +2366,18 @@ class Database:
                 continue
             result.append(dict(row))
         return result
+
+    def nonretryable_output_failures(self, run_id: str) -> int:
+        rows = self.connection.execute(
+            """SELECT raw_metadata_json FROM model_calls JOIN attempts USING (attempt_id)
+               WHERE attempts.run_id = ? AND model_calls.state = ?""",
+            (run_id, InvocationState.FAILED.value),
+        ).fetchall()
+        return sum(
+            json.loads(row["raw_metadata_json"] or "{}").get("failure_kind")
+            in {"output_limit_reached", "protocol_error"}
+            for row in rows
+        )
 
     def latest_role_call(self, attempt_id: str, role: str) -> sqlite3.Row | None:
         return self.fetch_one(

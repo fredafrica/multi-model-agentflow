@@ -26,6 +26,7 @@ from agentflow.contracts import (
 from agentflow.database import Database
 from agentflow.serialization import canonical_json, plan_hash
 from agentflow.states import InvocationState, TaskState
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def git(root: Path, *args: str) -> None:
@@ -52,7 +53,7 @@ def cli_plan() -> PlanContract:
         escalation_conditions=("failure",),
         expected_outputs=(),
     )
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="cli-plan",
         schema_version=1,
         version=1,

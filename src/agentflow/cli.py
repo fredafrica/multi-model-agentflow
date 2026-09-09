@@ -28,6 +28,7 @@ from .opencode_adapter import (
 )
 from .runner import Runner
 from .serialization import canonical_json, load_plan_json, plan_hash
+from .resource_budgets import plan_budget_summary
 from .states import ControlState, RunState
 from .workspace import GitWorkspace, GitWorkspaceError
 
@@ -321,7 +322,8 @@ def run_command(arguments: argparse.Namespace) -> int:
     paths = resolve_paths(arguments.project)
     if arguments.command == "plan" and arguments.plan_command == "show":
         plan = _load_plan(paths, arguments.file)
-        print(canonical_json({"plan": plan, "sha256": plan_hash(plan)}))
+        print(canonical_json({"plan": plan, "sha256": plan_hash(plan),
+                              "resource_budgets": plan_budget_summary(plan)}))
         return 0
 
     _READ_ONLY_COMMANDS = {"status", "logs", "cost", "supervisor-next", "handoff"}

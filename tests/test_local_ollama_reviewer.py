@@ -60,6 +60,7 @@ from test_runner import approved_response, make_plan, make_task
 
 
 PROVIDER = "ollama"
+from resource_budget_fixtures import budgeted_request
 MODEL_ID = "local-model"
 
 DENY_TOOLS = (
@@ -94,7 +95,7 @@ def ollama_review_request(
     read_only: bool = True,
     model_id: str = MODEL_ID,
 ) -> InvocationRequest:
-    return InvocationRequest(
+    return budgeted_request(
         call_id="call-1",
         request_key="request-1",
         run_id="run-1",
@@ -172,6 +173,8 @@ def make_run_stub(
         )
 
     def stub(args, **kwargs):
+        if args[1] == "--version":
+            return subprocess.CompletedProcess(args, 0, stdout="1.18.29\n", stderr="")
         if args[1] == "debug":
             env = kwargs.get("env")
             if env is not None and "OPENCODE_CONFIG_CONTENT" in env:
@@ -468,9 +471,16 @@ class LocalOllamaConfigBindingTests(unittest.TestCase):
 
     def test_extra_full_deny_tool_is_accepted(self) -> None:
         adapter = self._adapter(ollama_host="127.0.0.1:11434")
-        second = resolved_config_json(permission={**deny_permission(), "lsp": "deny"})
+        base_stub = make_run_stub()
+        def extra_deny(args, **kwargs):
+            result = base_stub(args, **kwargs)
+            if args[1] == "debug" and kwargs.get("env"):
+                parsed = json.loads(result.stdout)
+                parsed["permission"]["lsp"] = "deny"
+                result.stdout = json.dumps(parsed)
+            return result
         with mock.patch(
-            "subprocess.run", side_effect=make_run_stub(second_config=second)
+            "subprocess.run", side_effect=extra_deny
         ), mock.patch(
             "subprocess.Popen", return_value=_completed_process(review_events())
         ):
@@ -1086,6 +1096,8 @@ class LocalOllamaIntegrationTests(unittest.TestCase):
 
         def run_side_effect(args, **kwargs):
             if args and args[0] == "opencode-stub":
+                if args[1] == "--version":
+                    return subprocess.CompletedProcess(args, 0, stdout="1.18.29\n", stderr="")
                 if args[1] == "debug":
                     env = kwargs.get("env")
                     if env is not None and "OPENCODE_CONFIG_CONTENT" in env:

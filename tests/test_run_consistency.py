@@ -29,6 +29,7 @@ from agentflow.runner import Runner
 from agentflow.service import InvocationService
 from agentflow.states import ControlState, InvocationState, RunState, TaskState
 from agentflow.workspace import GitWorkspace
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def git(root: Path, *args: str) -> None:
@@ -59,7 +60,7 @@ def make_task(task_id: str = "task-1") -> TaskContract:
 
 
 def make_plan(tasks: tuple[TaskContract, ...]) -> PlanContract:
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="runner-plan",
         schema_version=1,
         version=1,

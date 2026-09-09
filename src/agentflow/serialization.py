@@ -12,6 +12,7 @@ from typing import Any, Mapping
 from .contracts import (
     DEFAULT_IMPLEMENTATION_MAX_CONTINUATIONS,
     DEFAULT_IMPLEMENTATION_MAX_STEPS,
+    DEFAULT_REVIEW_MAX_STEPS,
     DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS,
     DEFAULT_REMOTE_WORKER_MAX_STEPS,
     DEFAULT_REMOTE_WORKER_TIMEOUT_SECONDS,
@@ -23,6 +24,11 @@ from .contracts import (
     DataSensitivity,
     InputArtifact,
     ModelRef,
+    ModelRecord,
+    ModelCapabilitySnapshot,
+    ModelAvailabilityState,
+    TrustLevel,
+    DEFAULT_ROLE_MAX_OUTPUT_TOKENS,
     ModelSelectionStrategy,
     OperationalSafety,
     PlanContract,
@@ -146,6 +152,9 @@ def task_from_mapping(data: Mapping[str, Any]) -> TaskContract:
         implementation_max_steps=data.get(
             "implementation_max_steps", DEFAULT_IMPLEMENTATION_MAX_STEPS
         ),
+        review_max_steps=data.get("review_max_steps", DEFAULT_REVIEW_MAX_STEPS),
+        implementation_max_output_tokens=data.get("implementation_max_output_tokens", DEFAULT_ROLE_MAX_OUTPUT_TOKENS),
+        review_max_output_tokens=data.get("review_max_output_tokens", DEFAULT_ROLE_MAX_OUTPUT_TOKENS),
         implementation_timeout_seconds=data.get(
             "implementation_timeout_seconds", DEFAULT_IMPLEMENTATION_TIMEOUT_SECONDS
         ),
@@ -203,6 +212,9 @@ def supervisor_policy_from_mapping(data: Mapping[str, Any]) -> SupervisorPolicy:
 
 
 def plan_from_mapping(data: Mapping[str, Any]) -> PlanContract:
+    capabilities = data.get("model_capabilities", ())
+    if not isinstance(capabilities, (tuple, list)) or any(not isinstance(item, Mapping) for item in capabilities):
+        raise ValueError("model_capabilities must be a list of objects")
     return PlanContract(
         plan_id=str(data["plan_id"]),
         schema_version=int(data["schema_version"]),
@@ -225,7 +237,25 @@ def plan_from_mapping(data: Mapping[str, Any]) -> PlanContract:
         ),
         authorization_ttl_seconds=data.get("authorization_ttl_seconds", 86_400),
         supervisor_policy=supervisor_policy_from_mapping(data.get("supervisor_policy", {})),
+        model_capabilities=tuple(capability_from_mapping(item) for item in capabilities),
     )
+
+
+def capability_from_mapping(data: Mapping[str, Any]) -> ModelCapabilitySnapshot:
+    return ModelCapabilitySnapshot(
+        model_from_mapping(data["ref"]), data.get("context_length"),
+        data["max_output_tokens"], data["source"], data["source_version"],
+        data.get("api_model_id"),
+    )
+
+
+def model_record_from_mapping(data: Mapping[str, Any]) -> ModelRecord:
+    values = dict(data)
+    values["ref"] = model_from_mapping(values["ref"])
+    values["trust_level"] = TrustLevel(values["trust_level"])
+    values["highest_allowed_risk"] = BusinessImportance(values["highest_allowed_risk"])
+    values["availability_state"] = ModelAvailabilityState(values.get("availability_state", "unavailable"))
+    return ModelRecord(**values)
 
 
 def load_plan_json(text: str) -> PlanContract:

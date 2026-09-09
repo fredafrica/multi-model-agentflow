@@ -42,6 +42,7 @@ from agentflow.service import (
     PolicyDeniedError,
 )
 from agentflow.states import InvocationState, RunState, TaskState
+from resource_budget_fixtures import budgeted_plan_contract
 
 
 def make_task(
@@ -78,7 +79,7 @@ def make_plan(
     budget_mode: BudgetMode = BudgetMode.FIXED,
     task: TaskContract | None = None,
 ) -> PlanContract:
-    return PlanContract(
+    return budgeted_plan_contract(
         plan_id="plan-1",
         schema_version=1,
         version=1,

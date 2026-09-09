@@ -16,6 +16,10 @@ def issue_authorization(
     allow_d2_remote: bool = False,
     now: datetime | None = None,
 ) -> AuthorizationSnapshot:
+    required = {model.registry_key for task in plan.tasks for model in
+                (task.implementation_model, task.review_model, task.fallback_model) if model}
+    if required - {item.ref.registry_key for item in plan.model_capabilities}:
+        raise ValueError("model output capability snapshots are required before authorization")
     issued_at = now or datetime.now(timezone.utc)
     files = tuple(sorted({path for task in plan.tasks for path in task.allowed_files}))
     models = tuple(
