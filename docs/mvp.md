@@ -86,6 +86,7 @@ MVP 的重点是验证授权、安全和恢复闭环，不是覆盖所有模型�
 - implementation/revision 和 review/rereview 分别使用独立角色输出授权；所有主模型与 fallback 在批准前须有计划内精确能力快照及来源/版本，context/output 独立。
 - 具体默认值、严格类型、冻结/拒绝能力下降、API 别名与旧计划处理只以 AD-47 为准；OpenCode 的模型输出和运行时上限同时绑定到本次 effective 值。
 - 当前验证的 OpenAI-compatible transport 覆盖本机四条适配器路径；未验证 transport/输出覆盖安全停止。所有已知失败和 UNKNOWN 沿既有审计/恢复路径保存预算证据。
+- OpenCode `1.18.29+` 的稳定 `1.18.x` 补丁版在上述运行时复核全部通过时继续；更老版本、预发布版或不同 major/minor 系列推理前停止。版本兼容策略只替代精确补丁号锁定，不放宽 transport、预算、权限或配置门禁，详见 AD-50。
 
 ### 2.10 LM Studio 审核材料隔离
 

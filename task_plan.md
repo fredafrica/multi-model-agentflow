@@ -2,9 +2,11 @@
 
 ## Goal
 
-按 2026-09-08 资源预算交接计划修复 BUG-RB-01/02；复用现有 worktree，保留分项确定性证据，独立验收另行进行。
+完成 OpenCode 稳定补丁版本兼容修复；复用现有 worktree，保留确定性与离线审计证据，不调用真实模型。
 
 ## Current Phase
+
+里程碑 22：481 项全量测试通过，本地 GPT‑OSS 120B 在 131072 输出上限下真实只读审核通过，零 findings、零工具调用、零远程费用。代码与 Skill 的审核工作区 SHA-256 和主目录一致。证据见 `docs/verification/2026-09-09-opencode-compatibility.md`。
 
 里程碑 21 补充审核隔离：真实 Qwen 上轮返回两条 P3，zero_findings 未通过，且读取了旧工作树。本轮按 Owner 批准方案禁用 LM Studio 审核工具、复核最终权限并改善诊断；新增 6 项定向测试通过，全量 480 项通过（34.898 秒），本机 OpenCode 无推理配置复核通过。真实复验待新哈希批准；历史结果不覆盖。证据见 `docs/verification/2026-09-08-lmstudio-review-isolation-fix.md`。
 
@@ -16,9 +18,20 @@
 
 ## Next Step
 
-等待 Owner 安排不同模型自测与独立审核。真实 smoke、新计划授权、提交/合并和全局安装更新均需后续明确安排；本轮不自动执行。
+Owner 已授权在测试与审核通过后提交并同步安装 Skill；按本轮验收结果执行。后续运行沿用新的主目录代码与同步后的 Skill。
 
 ## Milestones
+
+### 里程碑 22：OpenCode 稳定补丁版本兼容
+
+**Status:** deterministic tests and independent review passed
+
+- [x] 复现本机 OpenCode `1.18.30` 被精确 `1.18.29` 门禁拒绝。
+- [x] 无推理审计 `1.18.30` 的 output 环境入口、默认上限、限制变换与 SDK 参数映射。
+- [x] TDD 实现同系列稳定补丁兼容与跨系列/旧版/预发布拒绝。
+- [x] 同步 PLAT-07、MVP 与 AD-50，不放宽其他运行时门禁。
+- [x] 481 项全量测试、compileall、diff 检查与离线构建验证。
+- [x] 本地 GPT‑OSS 120B 真实只读审核通过，输出授权 131072，零 findings。
 
 ### 里程碑 21：Reviewer 步骤与模型输出预算
 

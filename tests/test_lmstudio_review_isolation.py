@@ -76,18 +76,18 @@ class LMStudioReviewIsolationTests(unittest.TestCase):
                 self.assertEqual('allow', rules['edit'])
                 self.assertEqual('deny', rules['bash'])
 
-    def test_version_diagnostic_identifies_verified_and_found_versions(self):
+    def test_version_diagnostic_identifies_supported_series_and_found_version(self):
         with tempfile.TemporaryDirectory() as directory:
             request = local_request(directory)
             def run(args, **kwargs):
                 if args[1] == '--version':
-                    return subprocess.CompletedProcess(args, 0, stdout='1.18.30\n')
+                    return subprocess.CompletedProcess(args, 0, stdout='1.19.0\n')
                 return config_run(request)(args, **kwargs)
             with mock.patch('subprocess.run', side_effect=run), mock.patch('subprocess.Popen') as launch:
                 with self.assertRaises(ProviderNotConfiguredError) as error:
                     OpenCodeAdapter().invoke(request)
-                self.assertIn('1.18.29', str(error.exception))
-                self.assertIn('1.18.30', str(error.exception))
+                self.assertIn('1.18.x', str(error.exception))
+                self.assertIn('1.19.0', str(error.exception))
                 launch.assert_not_called()
 
     def test_override_diagnostic_names_key_but_never_value(self):

@@ -1575,12 +1575,20 @@ def _read_output_config(command: str, root: Path, timeout: int, *, environment: 
         )
     except (OSError, subprocess.TimeoutExpired) as error:
         raise ProviderNotConfiguredError("OpenCode output-control version cannot be verified") from error
-    if version.returncode or version.stdout.strip() != "1.18.29":
-        found = version.stdout.strip()
-        if version.returncode or not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[a-zA-Z0-9.-]+)?", found) or len(found) > 64:
+    found = version.stdout.strip()
+    match = re.fullmatch(r"([0-9]+)\.([0-9]+)\.([0-9]+)", found) if len(found) <= 64 else None
+    compatible = (
+        not version.returncode
+        and match is not None
+        and (int(match.group(1)), int(match.group(2))) == (1, 18)
+        and int(match.group(3)) >= 29
+    )
+    if not compatible:
+        if version.returncode or match is None or len(found) > 64:
             found = "unknown or invalid"
         raise ProviderNotConfiguredError(
-            f"OpenCode output-control version is unverified: verified=1.18.29, found={found}"
+            "OpenCode output-control version is incompatible: "
+            f"supported=1.18.29+ within 1.18.x, found={found}"
         )
     return _read_resolved_config(command, root, timeout, environment=environment)
 

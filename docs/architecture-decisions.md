@@ -275,7 +275,7 @@
 - 冻结规则：`effective=min(frozen capability, role authorization)`；fallback 使用自己的精确快照；续接重新从同一已授权计划与实际模型计算。能力、来源、别名、步骤或输出授权变化均改变哈希。执行时观察到更低 output/context 时拒绝（即便低值仍大于 role authorization）；catalog 来源在配置中消失也拒绝。更高能力不放大 effective。
 - OpenCode：同时写精确 provider/model 条目的 `limit.output` 与子进程 `OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`，避免内置 32000 运行时默认截断。深度保留 model options、其他 limits 和已验证端点/权限；存在 API 别名时必须在快照显式绑定。解析后的 model 配置按规范 JSON 比较，避免浮点/布尔相等陷阱；检查 agent steps 严格整数与权限。未验证的 provider 输出/思考覆盖在进程前拒绝。当前最终参数路径只验证了 `@ai-sdk/openai-compatible`，其他 transport 安全停止，不擅自声称其 SDK 行为已验证。本机当前 Ollama/LM Studio/DeepSeek 都使用该 transport。
 - 审计与存储：复用 plans canonical JSON、tasks contract JSON 和 model_calls.request_scope_json.resource_budgets；不建第二注册表或新业务恢复通道。当前仓库没有 ModelRecord 专属持久注册表表，发现记录经 canonical 序列化与 `model_record_from_mapping` 往返；实际执行证据由计划内快照持久化。费用预留、实际 Token 和输出上限继续分离，不补造总 Token/推理 Token 算法。
-- 运行时兼容门禁：推理前核对 OpenCode 版本为已验证的 1.18.29；其他版本安全停止，需补充离线参数路径证据后显式更新支持范围。版本号不是二进制真实性证明；本次已检查二进制的 SHA-256 记录在验证报告中。
+- 运行时兼容门禁：本轮历史实现曾将 OpenCode 精确锁定为 1.18.29；该规则已由 AD-50 的稳定补丁系列策略替代。版本号不是二进制真实性证明；对应二进制 SHA-256 记录在各轮验证报告中。
 - 旧计划：缺字段的计划可规范化读取（8/16000/16000/空快照），哈希因此变化，旧批准必然失效；不得原地改写历史 JSON/授权/调用。已保存的旧 ID/version 不能覆盖，重订计划需新 version 并重新展示哈希/授权。旧暂停 run 保留可读历史并拒绝旧授权恢复；后续业务重规划和既有产物重新审核由 Owner 独立安排，不自动迁移运行或重复调用。
 - 验收：实现者确定性检查不替代不同模型自测和独立审核；本轮无真实模型调用、无 API 费用、无提交/全局配置改动。证据见 `verification/2026-09-08-reviewer-resource-budgets.md`。
 
@@ -292,8 +292,15 @@
 - 状态：已接受（Owner 确认局部修复方案）。
 - LM Studio review/rereview 强制只读，复用 Reviewer 全工具 deny 规则；实际全局与所选 Agent 权限在推理前验证，不能依赖提示词禁止读取旧代码。实施/修订继续保留原文件权限，不新增合同字段、权限放行选项或存储通道。
 - 审核只以冻结材料为证据；缺少上下文应报告，不得读取工作树补充。工具权限约束不是 OS 沙箱承诺，真实复验须检查工具调用记录。
-- 两条 P3 按诊断改善处理：未验证版本提示已验证与实际版本；输出/思考覆盖提示配置项名称但不打印值。不放开未验证版本或 thinking 选项、不降低 zero_findings，也不据此宣称 P3 已获独立关闭。
+- 两条 P3 按诊断改善处理：不兼容版本提示支持系列与实际版本；输出/思考覆盖提示配置项名称但不打印值。版本放行范围后由 AD-50 调整；thinking 选项和 zero_findings 不放宽，也不据此宣称 P3 已获独立关闭。
 - 新代码与审核材料重新冻结后须重新展示哈希并获得批准；历史运行/授权/UNKNOWN 不变。不同模型独立自测仍为整体验收前置条件。
+
+### AD-50：OpenCode 稳定补丁版本兼容策略
+
+- 状态：已接受（Owner 于 2026-09-08 要求非实质兼容问题不要阻断后续运行）。
+- 决策：用“已核验 major/minor 系列 + 最低补丁基线 + 每次调用的运行时不变量复核”替代精确补丁号锁定。当前范围为稳定版 `1.18.29+` 且仍在 `1.18.x`；`1.18.30` 已通过本机无推理源码路径审计。更老版本、带预发布后缀的版本、无法解析的输出以及不同 major/minor 系列继续在推理前失败关闭。
+- 运行时条件：兼容补丁版只有在 AD-47/49 已有的最终 provider/model 配置、已验证 `@ai-sdk/openai-compatible` transport、API 别名、输出/思考覆盖、模型能力、两层权限、agent steps、enabled provider 与双重输出额度复核全部通过时才能启动推理。任何一项变化仍阻断，不能用版本兼容策略绕过。
+- 证据与影响：离线审计脚本改用语义模式而非压缩变量名，确认 `1.18.30` 仍保留 32000 默认、`OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX`、通用 output 限制变换与 compatible SDK `max_tokens` 映射；未产生模型调用或 API 费用。未来同系列补丁不再因补丁号本身要求改代码，但新的 minor/major 系列仍需独立审计后显式更新范围。本决定只替代 AD-47 的精确 `1.18.29` 版本门，不修改授权、预算、隐私、UNKNOWN、费用或审核门禁。
 
 ## 2. 原暂定、经实现验证后接受的决策
 

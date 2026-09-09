@@ -8,15 +8,22 @@ const {execFileSync} = require('child_process');
 const executable = process.argv[2];
 if (!executable) throw new Error('Pass the installed OpenCode executable path');
 const version = execFileSync(executable, ['--version'], {encoding: 'utf8'}).trim();
-assert.equal(version, '1.18.29', 'Re-audit the source path for another version');
+const parsedVersion = version.match(/^(\d+)\.(\d+)\.(\d+)$/);
+assert.ok(parsedVersion, 'OpenCode version is not a stable semantic version');
+assert.deepEqual(
+  parsedVersion.slice(1, 3).map(Number),
+  [1, 18],
+  'Re-audit the source path for another major/minor series',
+);
+assert.ok(Number(parsedVersion[3]) >= 29, 'OpenCode version predates the verified baseline');
 const bytes = fs.readFileSync(executable);
 const source = bytes.toString();
-const transform = source.match(/function \w+\(\$,Z=M7\)\{return Math\.min\(\$\.limit\.output,Z\)\|\|Z\}/)?.[0];
+const transform = source.match(/function \w+\(\$,([A-Za-z_$][\w$]*)=M7\)\{return Math\.min\(\$\.limit\.output,\1\)\|\|\1\}/)?.[0];
 assert.ok(transform, 'installed generic output-limit transform not found');
 assert.ok(source.includes('var M7=32000,'));
 assert.ok(source.includes('outputTokenMax:G("OPENCODE_EXPERIMENTAL_OUTPUT_TOKEN_MAX")'));
-assert.ok(source.includes('maxOutputTokens:ke.maxOutputTokens(e.model,e.flags.outputTokenMax)'));
-assert.ok(source.includes('maxOutputTokens:h.params.maxOutputTokens'));
+assert.match(source, /maxOutputTokens:\w+\.maxOutputTokens\(e\.model,e\.flags\.outputTokenMax\)/);
+assert.match(source, /maxOutputTokens:\w+\.params\.maxOutputTokens/);
 // The bundled OpenAI-compatible chat SDK passes the provided output limit to
 // max_tokens. Execute that exact property expression along with the transform.
 const sdk = source.match(/metadataKey:\w+\(this\.providerOptionsName,\w+\),args:\{model:this\.modelId,user:\w+\.user,(max_tokens:(\w+)),temperature:/);

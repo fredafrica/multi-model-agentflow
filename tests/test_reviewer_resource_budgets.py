@@ -207,9 +207,26 @@ class OutputBudgetContractTests(unittest.TestCase):
 
 
 class OutputBudgetAdapterTests(unittest.TestCase):
-    def test_unverified_opencode_version_stops_before_inference(self):
+    def test_newer_compatible_patch_version_runs_after_runtime_checks_pass(self):
         request = review_request()
-        for version in ('1.18.30', '', '1.18.29-custom'):
+        for version in ('1.18.30', '1.18.99'):
+            def run(args, **kwargs):
+                if args[1] == '--version':
+                    return subprocess.CompletedProcess(args, 0, stdout=version + '\n')
+                return config_run(request)(args, **kwargs)
+            captured = []
+            with self.subTest(version=version), mock.patch(
+                'subprocess.run', side_effect=run
+            ), mock.patch(
+                'subprocess.Popen', side_effect=step_process(1, captured)
+            ):
+                result = RemoteOpenCodeReviewerAdapter(request.model.provider).invoke(request)
+                self.assertTrue(json.loads(result.output)['approved'])
+                self.assertEqual(1, len(captured))
+
+    def test_incompatible_opencode_version_stops_before_inference(self):
+        request = review_request()
+        for version in ('1.18.28', '1.19.0', '2.0.0', '', '1.18.30-custom'):
             def run(args, **kwargs):
                 if args[1] == '--version':
                     return subprocess.CompletedProcess(args, 0, stdout=version)

@@ -30,6 +30,7 @@
 | PLAT-04 | 第一版不开发网页控制台。 | MVP 交付清单中没有 Web UI。 |
 | PLAT-05 | AgentFlow 必须能通过 OpenCode 调用计划与授权快照共同限定的远程 provider/model。远程 Reviewer 仅执行独立、只读的 `review`/`rereview`，不得绕过控制平面；远程 Worker 仅在任务合同显式允许（`allow_remote_implementation=true`）时承担 `implementation`/`revision`，并在最小临时沙箱内运行、网络默认拒绝。 | 使用 OpenCode 替身可观察到参数数组 `run --model <provider>/<model-id>`；未授权 provider、越界角色或非只读 Reviewer 请求在进程启动前被确定性拒绝。 |
 | PLAT-06 | AgentFlow 必须能通过 OpenCode 调用本地 Ollama 承担仅 `review`/`rereview` 角色。本地 Ollama 只接受严格回环端点、packet-only 只读最小 prompt 与全工具禁用；`implementation`/`revision` 等写角色、`read_only=false` 或非回环端点必须在任何推理进程启动前确定性拒绝。 | 使用 OpenCode 替身可观察到本地 Ollama 仅注册到 `review`/`rereview` 角色路由，写角色或远程端点调用被前置拒绝且推理 `Popen` 次数为 0。 |
+| PLAT-07 | OpenCode 兼容门禁必须区分稳定补丁升级与不兼容版本：已核验系列内不低于基线的稳定补丁版，可以在每次调用的最终配置、transport、模型别名、权限、步骤和输出额度复核全部通过后继续；更老版本、预发布版或不同 major/minor 系列必须在推理前拒绝。 | OpenCode 替身的兼容补丁版通过全部运行时复核后可启动；更老、预发布或跨系列版本的推理进程启动次数为 0。 |
 
 当前环境中的 Qwen 3.8 27B Q4、Qwen 3.8 27B 8-bit、GPT-OSS、DeepSeek V4 Flash 和 DeepSeek V4 Pro，以及未来可能采用的 GPT、Claude 或其他模型，均只视为用户提供的候选记录；名称、可用性和能力须在使用时发现或验证，不能成为通用 Skill 的永久默认值。
 
